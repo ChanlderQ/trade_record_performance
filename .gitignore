@@ -1,0 +1,18 @@
+# Local secrets
+.env
+
+# Generated reports
+account_report*.md
+
+# Price caches
+.fmp_cache/
+.price_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local trade workbooks and spreadsheets
+*.xlsx
+*.xls
+*.csv
