@@ -59,6 +59,29 @@ python3 generate_account_report.py \
   --output my_report.md
 ```
 
+## Daily GitHub Actions Run
+
+This repository includes a GitHub Actions workflow at
+`.github/workflows/daily-report.yml`.
+
+It runs every day at 13:00 UTC and can also be started manually from the
+**Actions** tab with **Run workflow**.
+
+Because trade records and generated reports should not be committed to the
+repository, the workflow expects the workbook to be available from a private
+download URL stored as a GitHub secret.
+
+Configure these repository secrets in GitHub:
+
+| Secret | Required | Purpose |
+| --- | --- | --- |
+| `TRADE_RECORD_URL` | Yes | Private download URL for the Excel workbook |
+| `FMP_API_KEY` | No | FMP API key; Yahoo Finance is used as fallback |
+
+The workflow downloads the workbook at runtime, generates the report, and saves
+the Markdown file as a workflow artifact. It does not commit the workbook or the
+generated report back to the repository.
+
 ## Workbook Format
 
 Both trade worksheets should contain these columns:
