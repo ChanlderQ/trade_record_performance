@@ -2,8 +2,8 @@
 """Generate account performance reports from the trade record workbook.
 
 The workbook is expected to contain two sheets:
-  - Trade record
-  - IB_trade_record
+  - UOB
+  - IB
 
 Latest prices are downloaded from Financial Modeling Prep (FMP) first. If FMP has
 no API key or a quote request fails, Yahoo Finance is used as a fallback.
@@ -28,8 +28,8 @@ import pandas as pd
 
 
 SHEETS = {
-    "Trade record": "Account 1",
-    "IB_trade_record": "IB Account",
+    "UOB": "UOB",
+    "IB": "IB",
 }
 
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]

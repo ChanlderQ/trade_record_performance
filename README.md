@@ -4,8 +4,8 @@ Generate a Markdown performance report from a trade-record Excel workbook.
 
 The script reads two worksheets:
 
-- `Trade record`
-- `IB_trade_record`
+- `UOB`
+- `IB`
 
 It calculates separate account reports and a combined report, including:
 
@@ -106,7 +106,7 @@ Both trade worksheets should contain these columns:
 | `Comm Fee` | Commission or fee |
 | `Trade Value` | Trade value from the source workbook |
 
-Only `Trade record` and `IB_trade_record` are read. Other worksheets are ignored.
+Only `UOB` and `IB` are read. Other worksheets are ignored.
 
 ## Notes
 
