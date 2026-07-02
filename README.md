@@ -78,6 +78,17 @@ Configure these repository secrets in GitHub:
 | `TRADE_RECORD_URL` | Yes | Private download URL for the Excel workbook |
 | `FMP_API_KEY` | No | FMP API key; Yahoo Finance is used as fallback |
 
+For a Google Sheet, `TRADE_RECORD_URL` can be the normal sheet URL:
+
+```text
+https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit
+```
+
+The workflow converts Google Sheet URLs to `.xlsx` export URLs automatically.
+The sheet must be shared so the workflow can download it, for example
+**Anyone with the link can view**. If the sheet requires an interactive Google
+login, GitHub Actions will download an HTML login page instead of an Excel file.
+
 The workflow downloads the workbook at runtime, generates the report, and saves
 the Markdown file as a workflow artifact. It does not commit the workbook or the
 generated report back to the repository.

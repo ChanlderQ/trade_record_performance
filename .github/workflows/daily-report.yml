@@ -30,8 +30,27 @@ jobs:
             echo "Missing required secret: TRADE_RECORD_URL"
             exit 1
           fi
+
+          DOWNLOAD_URL="$TRADE_RECORD_URL"
+          if [[ "$TRADE_RECORD_URL" =~ docs\.google\.com/spreadsheets/d/([^/]+) ]]; then
+            SHEET_ID="${BASH_REMATCH[1]}"
+            DOWNLOAD_URL="https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=xlsx"
+          fi
+
           mkdir -p data
-          curl -L "$TRADE_RECORD_URL" -o data/trade_record.xlsx
+          curl -fL "$DOWNLOAD_URL" -o data/trade_record.xlsx
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("data/trade_record.xlsx")
+          header = path.read_bytes()[:4]
+          if header != b"PK\x03\x04":
+              print("Downloaded file is not an .xlsx workbook.")
+              print("For Google Sheets, make sure the sheet is shared so the workflow can download it.")
+              print("If you use a normal Google Sheet URL, the workflow will convert it to an xlsx export URL.")
+              raise SystemExit(1)
+          PY
 
       - name: Generate report
         env:
