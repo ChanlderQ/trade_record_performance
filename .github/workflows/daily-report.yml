@@ -2,8 +2,8 @@ name: Daily Account Report
 
 on:
   schedule:
-    # Runs every day at 13:00 UTC.
-    - cron: "0 13 * * *"
+    # Runs every day at 04:10 UTC.
+    - cron: "10 4 * * *"
   workflow_dispatch:
 
 jobs:
