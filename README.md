@@ -64,8 +64,8 @@ python3 generate_account_report.py \
 This repository includes a GitHub Actions workflow at
 `.github/workflows/daily-report.yml`.
 
-It runs every day at 13:00 UTC and can also be started manually from the
-**Actions** tab with **Run workflow**.
+It runs Monday through Friday at 16:10 America/New_York time and can also be
+started manually from the **Actions** tab with **Run workflow**.
 
 Because trade records and generated reports should not be committed to the
 repository, the workflow expects the workbook to be available from a private

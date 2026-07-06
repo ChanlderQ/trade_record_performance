@@ -2,8 +2,10 @@ name: Daily Account Report
 
 on:
   schedule:
-    # Runs Monday through Friday at 04:10 UTC.
-    - cron: "10 4 * * 1-5"
+    # Covers 16:10 America/New_York during daylight saving time.
+    - cron: "10 20 * * 1-5"
+    # Covers 16:10 America/New_York during standard time.
+    - cron: "10 21 * * 1-5"
   workflow_dispatch:
 
 jobs:
@@ -11,18 +13,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check New York schedule
+        id: schedule-check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ny_time="$(TZ=America/New_York date +%H:%M)"
+          ny_day="$(TZ=America/New_York date +%u)"
+          if [ "$ny_time" = "16:10" ] && [ "$ny_day" -ge 1 ] && [ "$ny_day" -le 5 ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping because New York time is ${ny_time}, day ${ny_day}."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check out repository
+        if: steps.schedule-check.outputs.should_run == 'true'
         uses: actions/checkout@v7
 
       - name: Set up Python
+        if: steps.schedule-check.outputs.should_run == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: steps.schedule-check.outputs.should_run == 'true'
         run: pip install -r requirements.txt
 
       - name: Download trade record workbook
+        if: steps.schedule-check.outputs.should_run == 'true'
         env:
           TRADE_RECORD_URL: ${{ secrets.TRADE_RECORD_URL }}
         run: |
@@ -53,6 +76,7 @@ jobs:
           PY
 
       - name: Generate report
+        if: steps.schedule-check.outputs.should_run == 'true'
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: |
@@ -63,6 +87,7 @@ jobs:
             --force-refresh
 
       - name: Upload report artifact
+        if: steps.schedule-check.outputs.should_run == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: account-report-${{ github.run_id }}
