@@ -1,6 +1,9 @@
 # Local secrets
 .env
 
+# macOS
+.DS_Store
+
 # Generated reports
 account_report*.md
 

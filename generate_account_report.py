@@ -64,6 +64,7 @@ class PriceQuote:
     price: float
     source: str
     price_time: str | None = None
+    fetched_at: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,7 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-refresh",
         action="store_true",
-        help="Ignore cached latest-price responses and download prices again.",
+        help="Do not use cached fallback prices if live quote refresh fails.",
     )
     return parser.parse_args()
 
@@ -204,6 +205,7 @@ def fetch_fmp_quote(symbol: str, api_key: str | None) -> PriceQuote:
         price=float(quote["price"]),
         source="FMP",
         price_time=price_time,
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
 
@@ -251,6 +253,7 @@ def fetch_yahoo_quote(symbol: str) -> PriceQuote:
         price=float(price),
         source="Yahoo Finance",
         price_time=price_time,
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
 
@@ -263,10 +266,6 @@ def fetch_latest_quote(
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_latest.json"
 
-    if cache_file.exists() and not force_refresh:
-        cached = json.loads(cache_file.read_text())
-        return PriceQuote(**cached)
-
     errors = []
     try:
         quote = fetch_fmp_quote(symbol, api_key)
@@ -276,6 +275,10 @@ def fetch_latest_quote(
             quote = fetch_yahoo_quote(symbol)
         except RuntimeError as yahoo_exc:
             errors.append(str(yahoo_exc))
+            if cache_file.exists() and not force_refresh:
+                cached = PriceQuote(**json.loads(cache_file.read_text()))
+                cached.source = f"cached {cached.source}"
+                return cached
             raise RuntimeError(f"Could not fetch latest price for {symbol}: {'; '.join(errors)}") from yahoo_exc
 
     cache_file.write_text(json.dumps(quote.__dict__, indent=2, sort_keys=True))
@@ -372,7 +375,12 @@ def process_trades_until(
     )
 
 
-def build_account_report(account: str, trades: pd.DataFrame, prices: pd.DataFrame) -> AccountReport:
+def build_account_report(
+    account: str,
+    trades: pd.DataFrame,
+    prices: pd.DataFrame,
+    quotes: dict[str, PriceQuote],
+) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
     if trades.empty or prices.empty:
@@ -399,7 +407,7 @@ def build_account_report(account: str, trades: pd.DataFrame, prices: pd.DataFram
     return_pct = total_pnl / invested if invested else None
     annualized_return_pct = annualize(return_pct, first_trade, valuation_date)
 
-    positions = build_positions(open_qty, open_cost, last_price_row)
+    positions = build_positions(open_qty, open_cost, last_price_row, quotes)
     return AccountReport(
         account=account,
         trades=trades,
@@ -419,19 +427,27 @@ def build_positions(
     open_qty: dict[str, float],
     open_cost: dict[str, float],
     prices_on_date: pd.Series,
+    quotes: dict[str, PriceQuote],
 ) -> pd.DataFrame:
     rows = []
     for symbol, qty in sorted(open_qty.items()):
         if abs(qty) <= 1e-9:
             continue
         latest_price = float(prices_on_date[symbol])
+        cost_basis = open_cost.get(symbol, 0.0)
+        market_value = qty * latest_price
+        quote = quotes.get(symbol)
         rows.append(
             {
                 "Symbol": symbol,
                 "Open Qty": qty,
-                "Avg Buy Cost": open_cost.get(symbol, 0.0) / qty if qty else None,
+                "Avg Buy Cost": cost_basis / qty if qty else None,
                 "Latest Price": latest_price,
-                "Market Value": qty * latest_price,
+                "Cost Basis": cost_basis,
+                "Market Value": market_value,
+                "Unrealized P&L": market_value - cost_basis,
+                "Price Source": quote.source if quote else "n/a",
+                "Price Time": quote.price_time if quote and quote.price_time else "n/a",
             }
         )
     return pd.DataFrame(rows)
@@ -471,15 +487,19 @@ def markdown_table(df: pd.DataFrame, max_rows: int | None = None) -> str:
     display = df.copy()
     if max_rows is not None:
         display = display.head(max_rows)
+    money_columns = {
+        "Avg Buy Cost",
+        "Latest Price",
+        "Cost Basis",
+        "Market Value",
+        "Unrealized P&L",
+        "Realized P&L",
+        "Total P&L",
+        "Invested Capital",
+        "Drawdown Base",
+    }
     for col in display.columns:
-        if (
-            "P&L" in col
-            or "Capital" in col
-            or "Value" in col
-            or "Price" in col
-            or "Cost" in col
-            or "Base" in col
-        ):
+        if col in money_columns:
             display[col] = display[col].map(lambda x: money(float(x)) if pd.notna(x) else "n/a")
         elif col == "Return":
             display[col] = display[col].map(lambda x: pct(float(x)) if pd.notna(x) else "n/a")
@@ -504,7 +524,6 @@ def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
     if positions.empty:
         return positions
 
-    positions["Cost Basis"] = positions["Open Qty"] * positions["Avg Buy Cost"]
     grouped = (
         positions.groupby("Symbol", as_index=False)
         .agg(
@@ -513,6 +532,8 @@ def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
                 "Cost Basis": "sum",
                 "Market Value": "sum",
                 "Latest Price": "last",
+                "Price Source": "last",
+                "Price Time": "last",
             }
         )
         .sort_values("Symbol")
@@ -528,6 +549,8 @@ def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
             "Cost Basis",
             "Market Value",
             "Unrealized P&L",
+            "Price Source",
+            "Price Time",
         ]
     ]
     return grouped
@@ -665,7 +688,7 @@ def main() -> int:
         raise RuntimeError(f"Missing latest prices for symbols: {missing_symbols}")
 
     reports = [
-        build_account_report(account, trades, prices)
+        build_account_report(account, trades, prices, quotes)
         for account, trades in trades_by_account.items()
     ]
     combined = combine_reports(reports)
