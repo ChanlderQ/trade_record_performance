@@ -99,7 +99,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-refresh",
         action="store_true",
-        help="Do not use cached fallback prices if live quote refresh fails.",
+        help="Deprecated: latest prices are refreshed on every run.",
+    )
+    parser.add_argument(
+        "--allow-cache-fallback",
+        action="store_true",
+        help="Use cached prices only if both FMP and Yahoo live quote requests fail.",
     )
     return parser.parse_args()
 
@@ -261,7 +266,7 @@ def fetch_latest_quote(
     symbol: str,
     api_key: str | None,
     cache_dir: Path,
-    force_refresh: bool,
+    allow_cache_fallback: bool,
 ) -> PriceQuote:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_latest.json"
@@ -275,7 +280,7 @@ def fetch_latest_quote(
             quote = fetch_yahoo_quote(symbol)
         except RuntimeError as yahoo_exc:
             errors.append(str(yahoo_exc))
-            if cache_file.exists() and not force_refresh:
+            if cache_file.exists() and allow_cache_fallback:
                 cached = PriceQuote(**json.loads(cache_file.read_text()))
                 cached.source = f"cached {cached.source}"
                 return cached
@@ -289,10 +294,10 @@ def load_latest_prices(
     symbols: list[str],
     api_key: str | None,
     cache_dir: Path,
-    force_refresh: bool,
+    allow_cache_fallback: bool,
 ) -> dict[str, PriceQuote]:
     return {
-        symbol: fetch_latest_quote(symbol, api_key, cache_dir, force_refresh)
+        symbol: fetch_latest_quote(symbol, api_key, cache_dir, allow_cache_fallback)
         for symbol in symbols
     }
 
@@ -679,7 +684,7 @@ def main() -> int:
         symbols=symbols,
         api_key=api_key,
         cache_dir=Path(args.cache_dir),
-        force_refresh=args.force_refresh,
+        allow_cache_fallback=args.allow_cache_fallback,
     )
     prices = quotes_to_price_frame(quotes, as_of)
 

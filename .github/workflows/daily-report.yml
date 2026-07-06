@@ -83,8 +83,7 @@ jobs:
           mkdir -p reports
           python generate_account_report.py \
             --input data/trade_record.xlsx \
-            --output "reports/account_report_$(date +%F).md" \
-            --force-refresh
+            --output "reports/account_report_$(date +%F).md"
 
       - name: Upload report artifact
         if: steps.schedule-check.outputs.should_run == 'true'

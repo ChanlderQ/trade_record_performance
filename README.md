@@ -20,6 +20,9 @@ It calculates separate account reports and a combined report, including:
 Latest prices are fetched from Financial Modeling Prep first. If FMP has no API
 key or a quote request fails, the script falls back to Yahoo Finance.
 
+By default, quote prices are refreshed on every run. Cached prices are not used
+unless `--allow-cache-fallback` is passed explicitly.
+
 ## Setup
 
 Create a local `.env` file from the example:
@@ -116,3 +119,5 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - Sell commissions reduce sale proceeds.
 - Realized P&L uses FIFO matching.
 - Annualized return uses calendar days from first trade to valuation date.
+- If a report shows a price source starting with `cached`, the run used
+  `--allow-cache-fallback` because live quotes failed.
