@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import os
+import ssl
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -26,6 +27,11 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+try:
+    import certifi
+except ImportError:  # pragma: no cover - optional local dependency
+    certifi = None
+
 
 SHEETS = {
     "UOB": "UOB",
@@ -35,6 +41,12 @@ SHEETS = {
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+
+
+def ssl_context() -> ssl.SSLContext | None:
+    if certifi is None:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 @dataclass
@@ -179,7 +191,7 @@ def read_json_url(url: str) -> Any:
             )
         },
     )
-    with urlopen(request, timeout=30) as response:
+    with urlopen(request, timeout=30, context=ssl_context()) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
