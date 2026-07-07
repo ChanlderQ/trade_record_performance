@@ -97,8 +97,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--as-of",
-        default=date.today().isoformat(),
-        help="Valuation date in YYYY-MM-DD format. Defaults to today.",
+        default=None,
+        help=(
+            "Optional valuation date in YYYY-MM-DD format. "
+            "If omitted, latest quotes are used. If provided, prices are as of "
+            "the closest trading day on or before this date."
+        ),
     )
     parser.add_argument(
         "--api-key",
@@ -276,11 +280,14 @@ def fetch_yahoo_quote(symbol: str) -> PriceQuote:
     )
 
 
-def latest_price_on_or_before(rows: list[tuple[date, float]], target_date: date) -> float | None:
+def latest_price_on_or_before(
+    rows: list[tuple[date, float]],
+    target_date: date,
+) -> tuple[date, float] | None:
     valid_rows = [(row_date, price) for row_date, price in rows if row_date <= target_date]
     if not valid_rows:
         return None
-    return sorted(valid_rows, key=lambda item: item[0])[-1][1]
+    return sorted(valid_rows, key=lambda item: item[0])[-1]
 
 
 def fetch_fmp_historical_quote(
@@ -315,15 +322,16 @@ def fetch_fmp_historical_quote(
     for item in payload:
         if "date" in item and "close" in item and item["close"] is not None:
             rows.append((pd.to_datetime(item["date"]).date(), float(item["close"])))
-    price = latest_price_on_or_before(rows, target_date)
-    if price is None:
+    dated_price = latest_price_on_or_before(rows, target_date)
+    if dated_price is None:
         raise RuntimeError(f"FMP historical prices for {symbol} did not include a price on or before {target_date}")
+    price_date, price = dated_price
 
     return PriceQuote(
         symbol=symbol,
         price=price,
         source="FMP historical",
-        price_time=target_date.isoformat(),
+        price_time=price_date.isoformat(),
         fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
@@ -367,15 +375,16 @@ def fetch_yahoo_historical_quote(symbol: str, target_date: date) -> PriceQuote:
             continue
         row_date = datetime.fromtimestamp(int(timestamp)).date()
         rows.append((row_date, float(close)))
-    price = latest_price_on_or_before(rows, target_date)
-    if price is None:
+    dated_price = latest_price_on_or_before(rows, target_date)
+    if dated_price is None:
         raise RuntimeError(f"Yahoo Finance historical prices for {symbol} did not include a price on or before {target_date}")
+    price_date, price = dated_price
 
     return PriceQuote(
         symbol=symbol,
         price=price,
         source="Yahoo Finance historical",
-        price_time=target_date.isoformat(),
+        price_time=price_date.isoformat(),
         fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
@@ -762,6 +771,23 @@ def quotes_to_price_frame(quotes: dict[str, PriceQuote], valuation_date: date) -
     )
 
 
+def valuation_date_from_quotes(
+    quotes: dict[str, PriceQuote],
+    fallback_date: date,
+) -> date:
+    quote_dates = []
+    for quote in quotes.values():
+        if not quote.price_time:
+            continue
+        try:
+            quote_dates.append(pd.to_datetime(quote.price_time).date())
+        except (TypeError, ValueError):
+            continue
+    if not quote_dates:
+        return fallback_date
+    return min(quote_dates)
+
+
 def dataframe_to_markdown(df: pd.DataFrame) -> str:
     """Render a small DataFrame as a GitHub-flavored Markdown table."""
     if df.empty:
@@ -853,24 +879,56 @@ def main() -> int:
     workbook_path = Path(args.input).expanduser().resolve()
     output_name = args.output or f"account_report_{run_datetime:%Y-%m-%d}.md"
     output_path = Path(output_name).expanduser().resolve()
-    as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date()
-    ytd_start_date = date(as_of.year - 1, 12, 31)
+    requested_as_of = (
+        datetime.strptime(args.as_of, "%Y-%m-%d").date()
+        if args.as_of
+        else None
+    )
 
     trades_by_account = read_trades(workbook_path)
     all_trades = pd.concat(trades_by_account.values(), ignore_index=True)
-    _, _, combined_open_qty, _ = calculate_fifo(all_trades, as_of)
+    initial_cutoff_date = requested_as_of or date.today()
+    _, _, combined_open_qty, _ = calculate_fifo(all_trades, initial_cutoff_date)
     symbols = sorted(
         symbol for symbol, qty in combined_open_qty.items()
         if abs(qty) > 1e-9
     )
 
-    quotes = load_latest_prices(
-        symbols=symbols,
-        api_key=api_key,
-        cache_dir=Path(args.cache_dir),
-        allow_cache_fallback=args.allow_cache_fallback,
-    )
-    prices = quotes_to_price_frame(quotes, as_of)
+    if requested_as_of is None:
+        quotes = load_latest_prices(
+            symbols=symbols,
+            api_key=api_key,
+            cache_dir=Path(args.cache_dir),
+            allow_cache_fallback=args.allow_cache_fallback,
+        )
+        valuation_date = valuation_date_from_quotes(quotes, date.today())
+    else:
+        quotes = load_historical_prices(
+            symbols=symbols,
+            target_date=requested_as_of,
+            api_key=api_key,
+            cache_dir=Path(args.cache_dir),
+            allow_cache_fallback=args.allow_cache_fallback,
+        )
+        valuation_date = valuation_date_from_quotes(quotes, requested_as_of)
+        _, _, final_open_qty, _ = calculate_fifo(all_trades, valuation_date)
+        final_symbols = sorted(
+            symbol for symbol, qty in final_open_qty.items()
+            if abs(qty) > 1e-9
+        )
+        if final_symbols != symbols:
+            symbols = final_symbols
+            quotes = load_historical_prices(
+                symbols=symbols,
+                target_date=valuation_date,
+                api_key=api_key,
+                cache_dir=Path(args.cache_dir),
+                allow_cache_fallback=args.allow_cache_fallback,
+            )
+            valuation_date = valuation_date_from_quotes(quotes, valuation_date)
+
+    prices = quotes_to_price_frame(quotes, valuation_date)
+    ytd_start_date = date(valuation_date.year - 1, 12, 31)
 
     _, _, ytd_start_open_qty, _ = calculate_fifo(all_trades, ytd_start_date)
     ytd_start_symbols = sorted(

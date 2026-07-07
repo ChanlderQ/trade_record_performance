@@ -49,6 +49,10 @@ python3 generate_account_report.py \
   --as-of 2026-07-02
 ```
 
+If `--as-of` is omitted, the script uses latest available quotes. If `--as-of`
+is provided, the script uses prices from the closest trading day on or before
+that date.
+
 By default, the report is written as:
 
 ```text
