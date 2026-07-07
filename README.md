@@ -12,6 +12,7 @@ It calculates separate account reports and a combined report, including:
 - realized P&L using FIFO cost basis
 - unrealized P&L using latest market prices
 - total P&L
+- YTD total P&L versus the prior December 31
 - return
 - annualized return
 - per-account open positions

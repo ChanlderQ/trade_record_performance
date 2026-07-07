@@ -18,7 +18,7 @@ import os
 import ssl
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -40,6 +40,7 @@ SHEETS = {
 
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
+FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
@@ -66,6 +67,7 @@ class AccountReport:
     invested_capital: float
     return_pct: float | None
     annualized_return_pct: float | None
+    ytd_total_pnl: float | None
     first_trade_date: date | None
     last_valuation_date: date | None
 
@@ -274,6 +276,110 @@ def fetch_yahoo_quote(symbol: str) -> PriceQuote:
     )
 
 
+def latest_price_on_or_before(rows: list[tuple[date, float]], target_date: date) -> float | None:
+    valid_rows = [(row_date, price) for row_date, price in rows if row_date <= target_date]
+    if not valid_rows:
+        return None
+    return sorted(valid_rows, key=lambda item: item[0])[-1][1]
+
+
+def fetch_fmp_historical_quote(
+    symbol: str,
+    target_date: date,
+    api_key: str | None,
+) -> PriceQuote:
+    if not api_key:
+        raise RuntimeError("FMP API key is not set")
+
+    from_date = target_date - timedelta(days=10)
+    query = urlencode(
+        {
+            "symbol": symbol,
+            "from": from_date.isoformat(),
+            "to": target_date.isoformat(),
+            "apikey": api_key,
+        }
+    )
+    url = f"{FMP_HISTORY_URL}?{query}"
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(f"FMP historical HTTP error for {symbol}: {exc.code} {exc.reason}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"FMP historical network error for {symbol}: {exc.reason}") from exc
+
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"FMP returned no historical prices for {symbol}")
+
+    rows = []
+    for item in payload:
+        if "date" in item and "close" in item and item["close"] is not None:
+            rows.append((pd.to_datetime(item["date"]).date(), float(item["close"])))
+    price = latest_price_on_or_before(rows, target_date)
+    if price is None:
+        raise RuntimeError(f"FMP historical prices for {symbol} did not include a price on or before {target_date}")
+
+    return PriceQuote(
+        symbol=symbol,
+        price=price,
+        source="FMP historical",
+        price_time=target_date.isoformat(),
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def fetch_yahoo_historical_quote(symbol: str, target_date: date) -> PriceQuote:
+    start_dt = datetime.combine(target_date - timedelta(days=10), datetime.min.time())
+    end_dt = datetime.combine(target_date + timedelta(days=1), datetime.min.time())
+    query = urlencode(
+        {
+            "period1": int(start_dt.timestamp()),
+            "period2": int(end_dt.timestamp()),
+            "interval": "1d",
+        }
+    )
+    url = f"{YAHOO_CHART_URL.format(symbol=symbol)}?{query}"
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(f"Yahoo Finance historical HTTP error for {symbol}: {exc.code} {exc.reason}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Yahoo Finance historical network error for {symbol}: {exc.reason}") from exc
+
+    chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+    error = chart.get("error")
+    if error:
+        raise RuntimeError(f"Yahoo Finance historical error for {symbol}: {error}")
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"Yahoo Finance returned no historical prices for {symbol}")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    closes = (
+        result.get("indicators", {})
+        .get("quote", [{}])[0]
+        .get("close", [])
+    )
+    rows = []
+    for timestamp, close in zip(timestamps, closes):
+        if close is None:
+            continue
+        row_date = datetime.fromtimestamp(int(timestamp)).date()
+        rows.append((row_date, float(close)))
+    price = latest_price_on_or_before(rows, target_date)
+    if price is None:
+        raise RuntimeError(f"Yahoo Finance historical prices for {symbol} did not include a price on or before {target_date}")
+
+    return PriceQuote(
+        symbol=symbol,
+        price=price,
+        source="Yahoo Finance historical",
+        price_time=target_date.isoformat(),
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 def fetch_latest_quote(
     symbol: str,
     api_key: str | None,
@@ -302,6 +408,37 @@ def fetch_latest_quote(
     return quote
 
 
+def fetch_historical_quote(
+    symbol: str,
+    target_date: date,
+    api_key: str | None,
+    cache_dir: Path,
+    allow_cache_fallback: bool,
+) -> PriceQuote:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"{symbol}_{target_date.isoformat()}_historical.json"
+
+    errors = []
+    try:
+        quote = fetch_fmp_historical_quote(symbol, target_date, api_key)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        try:
+            quote = fetch_yahoo_historical_quote(symbol, target_date)
+        except RuntimeError as yahoo_exc:
+            errors.append(str(yahoo_exc))
+            if cache_file.exists() and allow_cache_fallback:
+                cached = PriceQuote(**json.loads(cache_file.read_text()))
+                cached.source = f"cached {cached.source}"
+                return cached
+            raise RuntimeError(
+                f"Could not fetch historical price for {symbol} on {target_date}: {'; '.join(errors)}"
+            ) from yahoo_exc
+
+    cache_file.write_text(json.dumps(quote.__dict__, indent=2, sort_keys=True))
+    return quote
+
+
 def load_latest_prices(
     symbols: list[str],
     api_key: str | None,
@@ -310,6 +447,25 @@ def load_latest_prices(
 ) -> dict[str, PriceQuote]:
     return {
         symbol: fetch_latest_quote(symbol, api_key, cache_dir, allow_cache_fallback)
+        for symbol in symbols
+    }
+
+
+def load_historical_prices(
+    symbols: list[str],
+    target_date: date,
+    api_key: str | None,
+    cache_dir: Path,
+    allow_cache_fallback: bool,
+) -> dict[str, PriceQuote]:
+    return {
+        symbol: fetch_historical_quote(
+            symbol,
+            target_date,
+            api_key,
+            cache_dir,
+            allow_cache_fallback,
+        )
         for symbol in symbols
     }
 
@@ -397,6 +553,8 @@ def build_account_report(
     trades: pd.DataFrame,
     prices: pd.DataFrame,
     quotes: dict[str, PriceQuote],
+    ytd_start_prices: pd.DataFrame,
+    ytd_start_date: date,
 ) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
@@ -411,6 +569,7 @@ def build_account_report(
             invested_capital=0.0,
             return_pct=None,
             annualized_return_pct=None,
+            ytd_total_pnl=None,
             first_trade_date=None,
             last_valuation_date=None,
         )
@@ -423,6 +582,12 @@ def build_account_report(
     total_pnl = realized + unrealized
     return_pct = total_pnl / invested if invested else None
     annualized_return_pct = annualize(return_pct, first_trade, valuation_date)
+    ytd_total_pnl = calculate_ytd_total_pnl(
+        trades,
+        ytd_start_date,
+        ytd_start_prices,
+        total_pnl,
+    )
 
     positions = build_positions(open_qty, open_cost, last_price_row, quotes)
     return AccountReport(
@@ -435,9 +600,28 @@ def build_account_report(
         invested_capital=invested,
         return_pct=return_pct,
         annualized_return_pct=annualized_return_pct,
+        ytd_total_pnl=ytd_total_pnl,
         first_trade_date=first_trade,
         last_valuation_date=valuation_date,
     )
+
+
+def calculate_ytd_total_pnl(
+    trades: pd.DataFrame,
+    ytd_start_date: date,
+    ytd_start_prices: pd.DataFrame,
+    current_total_pnl: float,
+) -> float:
+    if ytd_start_prices.empty:
+        start_price_row = pd.Series(dtype=float)
+    else:
+        start_price_row = ytd_start_prices.iloc[0]
+    realized, unrealized, _, _, _, _ = process_trades_until(
+        trades,
+        ytd_start_date,
+        start_price_row,
+    )
+    return current_total_pnl - (realized + unrealized)
 
 
 def build_positions(
@@ -490,6 +674,10 @@ def combine_reports(reports: list[AccountReport]) -> dict[str, Any]:
         "invested_capital": invested,
         "return_pct": return_pct,
         "annualized_return_pct": annualize(return_pct, first_trade, last_date),
+        "ytd_total_pnl": sum(
+            report.ytd_total_pnl for report in reports
+            if report.ytd_total_pnl is not None
+        ),
         "first_trade_date": first_trade,
         "last_valuation_date": last_date,
     }
@@ -509,6 +697,7 @@ def markdown_table(df: pd.DataFrame, max_rows: int | None = None) -> str:
         "Unrealized P&L",
         "Realized P&L",
         "Total P&L",
+        "YTD Total P&L",
         "Invested Capital",
         "Drawdown Base",
     }
@@ -609,6 +798,7 @@ def write_report(
         f"- Valuation date: {combined['last_valuation_date']}",
         "- Method: FIFO realized P&L; buy commissions are included in cost basis; sell commissions reduce proceeds.",
         "- Return definition: total P&L divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
+        "- YTD Total P&L definition: current total P&L minus total P&L as of the prior December 31.",
         "",
         "## Combined Accounts",
         "",
@@ -646,6 +836,7 @@ def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
         ("Realized P&L", money(getter("realized_pnl"))),
         ("Unrealized P&L", money(getter("unrealized_pnl"))),
         ("Total P&L", money(getter("total_pnl"))),
+        ("YTD Total P&L", money(getter("ytd_total_pnl"))),
         ("Return", pct(getter("return_pct"))),
         ("Annualized return", pct(getter("annualized_return_pct"))),
     ]
@@ -663,6 +854,7 @@ def main() -> int:
     output_name = args.output or f"account_report_{run_datetime:%Y-%m-%d}.md"
     output_path = Path(output_name).expanduser().resolve()
     as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date()
+    ytd_start_date = date(as_of.year - 1, 12, 31)
 
     trades_by_account = read_trades(workbook_path)
     all_trades = pd.concat(trades_by_account.values(), ignore_index=True)
@@ -680,12 +872,33 @@ def main() -> int:
     )
     prices = quotes_to_price_frame(quotes, as_of)
 
+    _, _, ytd_start_open_qty, _ = calculate_fifo(all_trades, ytd_start_date)
+    ytd_start_symbols = sorted(
+        symbol for symbol, qty in ytd_start_open_qty.items()
+        if abs(qty) > 1e-9
+    )
+    ytd_start_quotes = load_historical_prices(
+        symbols=ytd_start_symbols,
+        target_date=ytd_start_date,
+        api_key=api_key,
+        cache_dir=Path(args.cache_dir),
+        allow_cache_fallback=args.allow_cache_fallback,
+    )
+    ytd_start_prices = quotes_to_price_frame(ytd_start_quotes, ytd_start_date)
+
     missing_symbols = [symbol for symbol in symbols if symbol not in prices.columns]
     if missing_symbols:
         raise RuntimeError(f"Missing latest prices for symbols: {missing_symbols}")
 
     reports = [
-        build_account_report(account, trades, prices, quotes)
+        build_account_report(
+            account,
+            trades,
+            prices,
+            quotes,
+            ytd_start_prices,
+            ytd_start_date,
+        )
         for account, trades in trades_by_account.items()
     ]
     combined = combine_reports(reports)
