@@ -39,6 +39,7 @@ SHEETS = {
 }
 
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]
+CASH_SYMBOL = "CASH"
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -65,6 +66,8 @@ class AccountReport:
     unrealized_pnl: float
     total_pnl: float
     invested_capital: float
+    net_cash_flow: float
+    cash_balance: float
     return_pct: float | None
     annualized_return_pct: float | None
     ytd_total_pnl: float | None
@@ -185,6 +188,10 @@ def read_trades(workbook_path: Path) -> dict[str, pd.DataFrame]:
         df["Account"] = account_name
         result[account_name] = df
     return result
+
+
+def is_cash_symbol(symbol: str) -> bool:
+    return str(symbol).upper().strip() == CASH_SYMBOL
 
 
 def read_json_url(url: str) -> Any:
@@ -490,6 +497,8 @@ def calculate_fifo(
     day_trades = trades[trades["Date"] <= through_date]
     for _, row in day_trades.iterrows():
         symbol = row["Symbol"]
+        if is_cash_symbol(symbol):
+            continue
         qty = float(row["Qty"])
         price = float(row["Price"])
         fee = float(row["Comm Fee"])
@@ -532,6 +541,27 @@ def calculate_fifo(
     return realized_pnl, invested_capital, dict(open_qty), dict(open_cost)
 
 
+def calculate_cash_metrics(trades: pd.DataFrame, through_date: date) -> tuple[float, float]:
+    day_trades = trades[trades["Date"] <= through_date]
+    net_cash_flow = 0.0
+    security_cash_effect = 0.0
+
+    for _, row in day_trades.iterrows():
+        symbol = row["Symbol"]
+        qty = float(row["Qty"])
+        price = float(row["Price"])
+        fee = float(row["Comm Fee"])
+
+        if is_cash_symbol(symbol):
+            net_cash_flow += qty * price - fee
+        elif qty > 0:
+            security_cash_effect -= qty * price + fee
+        else:
+            security_cash_effect += (-qty) * price - fee
+
+    return net_cash_flow, net_cash_flow + security_cash_effect
+
+
 def process_trades_until(
     trades: pd.DataFrame,
     through_date: date,
@@ -567,7 +597,7 @@ def build_account_report(
 ) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
-    if trades.empty or prices.empty:
+    if trades.empty or len(prices.index) == 0:
         return AccountReport(
             account=account,
             trades=trades,
@@ -576,6 +606,8 @@ def build_account_report(
             unrealized_pnl=0.0,
             total_pnl=0.0,
             invested_capital=0.0,
+            net_cash_flow=0.0,
+            cash_balance=0.0,
             return_pct=None,
             annualized_return_pct=None,
             ytd_total_pnl=None,
@@ -588,8 +620,10 @@ def build_account_report(
     realized, unrealized, invested, open_qty, open_cost, _ = process_trades_until(
         trades, valuation_date, last_price_row
     )
+    net_cash_flow, cash_balance = calculate_cash_metrics(trades, valuation_date)
     total_pnl = realized + unrealized
-    return_pct = total_pnl / invested if invested else None
+    return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
+    return_pct = total_pnl / return_base if return_base else None
     annualized_return_pct = annualize(return_pct, first_trade, valuation_date)
     ytd_total_pnl = calculate_ytd_total_pnl(
         trades,
@@ -607,6 +641,8 @@ def build_account_report(
         unrealized_pnl=unrealized,
         total_pnl=total_pnl,
         invested_capital=invested,
+        net_cash_flow=net_cash_flow,
+        cash_balance=cash_balance,
         return_pct=return_pct,
         annualized_return_pct=annualized_return_pct,
         ytd_total_pnl=ytd_total_pnl,
@@ -670,17 +706,28 @@ def annualize(return_pct: float | None, start: date | None, end: date | None) ->
 
 
 def combine_reports(reports: list[AccountReport]) -> dict[str, Any]:
-    first_trade = min(report.first_trade_date for report in reports if report.first_trade_date)
-    last_date = max(report.last_valuation_date for report in reports if report.last_valuation_date)
+    first_trade_dates = [
+        report.first_trade_date for report in reports if report.first_trade_date
+    ]
+    last_valuation_dates = [
+        report.last_valuation_date for report in reports if report.last_valuation_date
+    ]
+    first_trade = min(first_trade_dates) if first_trade_dates else None
+    last_date = max(last_valuation_dates) if last_valuation_dates else None
     total_pnl = sum(report.total_pnl for report in reports)
     invested = sum(report.invested_capital for report in reports)
-    return_pct = total_pnl / invested if invested else None
+    net_cash_flow = sum(report.net_cash_flow for report in reports)
+    cash_balance = sum(report.cash_balance for report in reports)
+    return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
+    return_pct = total_pnl / return_base if return_base else None
 
     return {
         "realized_pnl": sum(report.realized_pnl for report in reports),
         "unrealized_pnl": sum(report.unrealized_pnl for report in reports),
         "total_pnl": total_pnl,
         "invested_capital": invested,
+        "net_cash_flow": net_cash_flow,
+        "cash_balance": cash_balance,
         "return_pct": return_pct,
         "annualized_return_pct": annualize(return_pct, first_trade, last_date),
         "ytd_total_pnl": sum(
@@ -725,14 +772,15 @@ def markdown_table(df: pd.DataFrame, max_rows: int | None = None) -> str:
 
 
 def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
-    positions = pd.concat(
-        [
-            report.positions.assign(Account=report.account)
-            for report in reports
-            if not report.positions.empty
-        ],
-        ignore_index=True,
-    )
+    position_frames = [
+        report.positions.assign(Account=report.account)
+        for report in reports
+        if not report.positions.empty
+    ]
+    if not position_frames:
+        return pd.DataFrame()
+
+    positions = pd.concat(position_frames, ignore_index=True)
     if positions.empty:
         return positions
 
@@ -823,7 +871,7 @@ def write_report(
         f"- Run date: {run_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Valuation date: {combined['last_valuation_date']}",
         "- Method: FIFO realized P&L; buy commissions are included in cost basis; sell commissions reduce proceeds.",
-        "- Return definition: total P&L divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
+        "- Return definition: total P&L divided by net cash flow when CASH rows exist; otherwise divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
         "- YTD Total P&L definition: current total P&L minus total P&L as of the prior December 31.",
         "",
         "## Combined Accounts",
@@ -855,10 +903,17 @@ def write_report(
 
 def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
     getter = obj.get if isinstance(obj, dict) else lambda key: getattr(obj, key)
+    def text(value: Any) -> Any:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        return value
+
     rows = [
-        ("First trade date", getter("first_trade_date")),
-        ("Last valuation date", getter("last_valuation_date")),
+        ("First trade date", text(getter("first_trade_date"))),
+        ("Last valuation date", text(getter("last_valuation_date"))),
         ("Invested capital", money(getter("invested_capital"))),
+        ("Net cash flow", money(getter("net_cash_flow"))),
+        ("Cash balance", money(getter("cash_balance"))),
         ("Realized P&L", money(getter("realized_pnl"))),
         ("Unrealized P&L", money(getter("unrealized_pnl"))),
         ("Total P&L", money(getter("total_pnl"))),
@@ -889,7 +944,7 @@ def main() -> int:
     _, _, combined_open_qty, _ = calculate_fifo(all_trades, initial_cutoff_date)
     symbols = sorted(
         symbol for symbol, qty in combined_open_qty.items()
-        if abs(qty) > 1e-9
+        if abs(qty) > 1e-9 and not is_cash_symbol(symbol)
     )
 
     if requested_as_of is None:
@@ -912,7 +967,7 @@ def main() -> int:
         _, _, final_open_qty, _ = calculate_fifo(all_trades, valuation_date)
         final_symbols = sorted(
             symbol for symbol, qty in final_open_qty.items()
-            if abs(qty) > 1e-9
+            if abs(qty) > 1e-9 and not is_cash_symbol(symbol)
         )
         if final_symbols != symbols:
             symbols = final_symbols
@@ -933,7 +988,7 @@ def main() -> int:
     _, _, ytd_start_open_qty, _ = calculate_fifo(all_trades, ytd_start_date)
     ytd_start_symbols = sorted(
         symbol for symbol, qty in ytd_start_open_qty.items()
-        if abs(qty) > 1e-9
+        if abs(qty) > 1e-9 and not is_cash_symbol(symbol)
     )
     ytd_start_quotes = load_historical_prices(
         symbols=ytd_start_symbols,

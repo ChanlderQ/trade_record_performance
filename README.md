@@ -15,6 +15,7 @@ It calculates separate account reports and a combined report, including:
 - YTD total P&L versus the prior December 31
 - return
 - annualized return
+- net cash flow and cash balance when `CASH` rows are present
 - per-account open positions
 - combined open positions
 
@@ -117,6 +118,12 @@ Both trade worksheets should contain these columns:
 | `Comm Fee` | Commission or fee |
 | `Trade Value` | Trade value from the source workbook |
 
+Cash deposits and withdrawals can be recorded with `Symbol` set to `CASH`,
+`Price` set to `1`, `Comm Fee` set to `0`, positive `Qty` for deposits, and
+negative `Qty` for withdrawals. `CASH` rows are treated as account cash flows:
+they are not included in open positions and no market quote is requested for
+`CASH`.
+
 Only `UOB` and `IB` are read. Other worksheets are ignored.
 
 ## Notes
@@ -126,4 +133,6 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - Buy commissions are included in cost basis.
 - Sell commissions reduce sale proceeds.
 - Realized P&L uses FIFO matching.
+- When `CASH` rows exist, return is total P&L divided by net cash flow.
+  Without `CASH` rows, return is total P&L divided by cumulative buy cost.
 - Annualized return uses calendar days from first trade to valuation date.
