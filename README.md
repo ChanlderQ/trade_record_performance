@@ -119,5 +119,3 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - Sell commissions reduce sale proceeds.
 - Realized P&L uses FIFO matching.
 - Annualized return uses calendar days from first trade to valuation date.
-- If a report shows a price source starting with `cached`, the run used
-  `--allow-cache-fallback` because live quotes failed.

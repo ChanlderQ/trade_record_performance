@@ -453,7 +453,6 @@ def build_positions(
         latest_price = float(prices_on_date[symbol])
         cost_basis = open_cost.get(symbol, 0.0)
         market_value = qty * latest_price
-        quote = quotes.get(symbol)
         rows.append(
             {
                 "Symbol": symbol,
@@ -463,8 +462,6 @@ def build_positions(
                 "Cost Basis": cost_basis,
                 "Market Value": market_value,
                 "Unrealized P&L": market_value - cost_basis,
-                "Price Source": quote.source if quote else "n/a",
-                "Price Time": quote.price_time if quote and quote.price_time else "n/a",
             }
         )
     return pd.DataFrame(rows)
@@ -549,8 +546,6 @@ def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
                 "Cost Basis": "sum",
                 "Market Value": "sum",
                 "Latest Price": "last",
-                "Price Source": "last",
-                "Price Time": "last",
             }
         )
         .sort_values("Symbol")
@@ -566,8 +561,6 @@ def combine_positions(reports: list[AccountReport]) -> pd.DataFrame:
             "Cost Basis",
             "Market Value",
             "Unrealized P&L",
-            "Price Source",
-            "Price Time",
         ]
     ]
     return grouped
@@ -577,18 +570,6 @@ def quotes_to_price_frame(quotes: dict[str, PriceQuote], valuation_date: date) -
     return pd.DataFrame(
         [{symbol: quote.price for symbol, quote in quotes.items()}],
         index=[pd.Timestamp(valuation_date)],
-    )
-
-
-def price_source_summary(quotes: dict[str, PriceQuote]) -> str:
-    if not quotes:
-        return "No open positions requiring market prices"
-    by_source: dict[str, list[str]] = defaultdict(list)
-    for symbol, quote in sorted(quotes.items()):
-        by_source[quote.source].append(symbol)
-    return "; ".join(
-        f"{source}: {', '.join(symbols)}"
-        for source, symbols in sorted(by_source.items())
     )
 
 
@@ -626,7 +607,6 @@ def write_report(
         f"- Source workbook: `{workbook_path}`",
         f"- Run date: {run_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Valuation date: {combined['last_valuation_date']}",
-        f"- Price source: {price_source_summary(quotes)}",
         "- Method: FIFO realized P&L; buy commissions are included in cost basis; sell commissions reduce proceeds.",
         "- Return definition: total P&L divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
         "",
