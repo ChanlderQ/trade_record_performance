@@ -877,8 +877,6 @@ def main() -> int:
     api_key = get_api_key(args.api_key, dotenv_path)
 
     workbook_path = Path(args.input).expanduser().resolve()
-    output_name = args.output or f"account_report_{run_datetime:%Y-%m-%d}.md"
-    output_path = Path(output_name).expanduser().resolve()
     requested_as_of = (
         datetime.strptime(args.as_of, "%Y-%m-%d").date()
         if args.as_of
@@ -928,6 +926,8 @@ def main() -> int:
             valuation_date = valuation_date_from_quotes(quotes, valuation_date)
 
     prices = quotes_to_price_frame(quotes, valuation_date)
+    output_name = args.output or f"account_report_{valuation_date:%Y-%m-%d}.md"
+    output_path = Path(output_name).expanduser().resolve()
     ytd_start_date = date(valuation_date.year - 1, 12, 31)
 
     _, _, ytd_start_open_qty, _ = calculate_fifo(all_trades, ytd_start_date)

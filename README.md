@@ -53,11 +53,14 @@ If `--as-of` is omitted, the script uses latest available quotes. If `--as-of`
 is provided, the script uses prices from the closest trading day on or before
 that date.
 
-By default, the report is written as:
+By default, the report is written using the valuation date:
 
 ```text
 account_report_YYYY-MM-DD.md
 ```
+
+For an `--as-of` report, `YYYY-MM-DD` is the closest trading day on or before
+the requested date.
 
 You can override the output path:
 
