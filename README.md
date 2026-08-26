@@ -17,6 +17,8 @@ It calculates separate account reports and a combined report, including:
 - annualized return
 - concurrent VOO price return from the account's first trade date
 - return relative to VOO, calculated as account return minus VOO return
+- money-weighted account return (XIRR) when CASH flows are present
+- cash-flow-matched VOO ending value, P&L, return, XIRR, and relative XIRR
 - net cash flow and cash balance when `CASH` rows are present
 - per-account open positions
 - combined open positions
@@ -135,6 +137,11 @@ negative `Qty` for withdrawals. `CASH` rows are treated as account cash flows:
 they are not included in open positions and no market quote is requested for
 `CASH`.
 
+For the cash-flow-matched VOO comparison, each deposit is treated as a purchase
+of fractional VOO shares and each withdrawal as a sale on the closest trading
+day on or before the cash-flow date. The report compares account XIRR with the
+XIRR of this simulated VOO account using the same dated cash flows.
+
 Only `UOB` and `IB` are read. Other worksheets are ignored.
 
 ## Notes
@@ -146,8 +153,13 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - Realized P&L uses FIFO matching.
 - When `CASH` rows exist, return is total P&L divided by net cash flow.
   Without `CASH` rows, return is total P&L divided by cumulative buy cost.
-- Annualized return uses calendar days from first trade to valuation date.
+- Simple annualized return uses calendar days from first trade to valuation
+  date. When dated CASH flows are present, XIRR is the preferred annualized
+  performance measure.
 - The VOO benchmark uses the closing price from the closest trading day on or
   before the account's first trade date and the report's valuation price. The
   combined-account comparison starts on the earliest first trade date across
   all accounts. Relative return is the account return minus the VOO return.
+- XIRR is shown only when the dated investor cash flows contain at least one
+  contribution and one positive terminal value or withdrawal. Relative XIRR is
+  the account XIRR minus the cash-flow-matched VOO XIRR.

@@ -69,12 +69,19 @@ class AccountReport:
     invested_capital: float
     net_cash_flow: float
     cash_balance: float
+    ending_value: float
     return_pct: float | None
     annualized_return_pct: float | None
+    money_weighted_return_pct: float | None
     benchmark_start_price: float | None
     benchmark_end_price: float | None
     benchmark_return_pct: float | None
     relative_to_benchmark_pct: float | None
+    matched_benchmark_ending_value: float | None
+    matched_benchmark_pnl: float | None
+    matched_benchmark_return_pct: float | None
+    matched_benchmark_money_weighted_return_pct: float | None
+    relative_money_weighted_return_pct: float | None
     ytd_total_pnl: float | None
     first_trade_date: date | None
     last_valuation_date: date | None
@@ -87,6 +94,14 @@ class PriceQuote:
     source: str
     price_time: str | None = None
     fetched_at: str | None = None
+
+
+@dataclass
+class CashFlowBenchmark:
+    ending_value: float
+    pnl: float
+    return_pct: float | None
+    money_weighted_return_pct: float | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -570,6 +585,164 @@ def calculate_cash_metrics(trades: pd.DataFrame, through_date: date) -> tuple[fl
     return net_cash_flow, net_cash_flow + security_cash_effect
 
 
+def external_cash_flows(
+    trades: pd.DataFrame,
+    through_date: date,
+) -> list[tuple[date, float]]:
+    cash_rows = trades[
+        (trades["Date"] <= through_date) & trades["Symbol"].map(is_cash_symbol)
+    ]
+    flows_by_date: dict[date, float] = defaultdict(float)
+    for _, row in cash_rows.iterrows():
+        amount = float(row["Qty"]) * float(row["Price"]) - float(row["Comm Fee"])
+        flows_by_date[row["Date"]] += amount
+    return [
+        (flow_date, amount)
+        for flow_date, amount in sorted(flows_by_date.items())
+        if abs(amount) > 1e-9
+    ]
+
+
+def xnpv(rate: float, cash_flows: list[tuple[date, float]]) -> float:
+    if rate <= -1:
+        raise ValueError("XNPV rate must be greater than -100%")
+    start_date = min(flow_date for flow_date, _ in cash_flows)
+    return sum(
+        amount / (1 + rate) ** ((flow_date - start_date).days / 365)
+        for flow_date, amount in cash_flows
+    )
+
+
+def calculate_xirr(cash_flows: list[tuple[date, float]]) -> float | None:
+    flows_by_date: dict[date, float] = defaultdict(float)
+    for flow_date, amount in cash_flows:
+        flows_by_date[flow_date] += amount
+    flows = [
+        (flow_date, amount)
+        for flow_date, amount in sorted(flows_by_date.items())
+        if abs(amount) > 1e-9
+    ]
+    if not flows:
+        return None
+    if flows[0][0] == flows[-1][0]:
+        return None
+    amounts = [amount for _, amount in flows]
+    if not any(amount < 0 for amount in amounts) or not any(
+        amount > 0 for amount in amounts
+    ):
+        return None
+
+    # Newton's method matches the conventional 10% starting guess used by XIRR.
+    rate = 0.10
+    start_date = flows[0][0]
+    for _ in range(100):
+        value = xnpv(rate, flows)
+        derivative = sum(
+            -((flow_date - start_date).days / 365)
+            * amount
+            / (1 + rate) ** (((flow_date - start_date).days / 365) + 1)
+            for flow_date, amount in flows
+        )
+        if abs(value) <= 1e-7:
+            return rate
+        if abs(derivative) <= 1e-12:
+            break
+        next_rate = rate - value / derivative
+        if not math.isfinite(next_rate) or next_rate <= -0.999999:
+            break
+        rate = next_rate
+
+    # Fall back to a bracket search when Newton's method is unstable.
+    candidates = [
+        -0.9999,
+        -0.99,
+        -0.9,
+        -0.75,
+        -0.5,
+        -0.25,
+        0.0,
+        0.1,
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        100.0,
+        1000.0,
+    ]
+    previous_rate = candidates[0]
+    previous_value = xnpv(previous_rate, flows)
+    for candidate_rate in candidates[1:]:
+        candidate_value = xnpv(candidate_rate, flows)
+        if candidate_value == 0:
+            return candidate_rate
+        if previous_value * candidate_value < 0:
+            low, high = previous_rate, candidate_rate
+            low_value = previous_value
+            for _ in range(200):
+                midpoint = (low + high) / 2
+                midpoint_value = xnpv(midpoint, flows)
+                if abs(midpoint_value) <= 1e-7:
+                    return midpoint
+                if low_value * midpoint_value <= 0:
+                    high = midpoint
+                else:
+                    low = midpoint
+                    low_value = midpoint_value
+            return (low + high) / 2
+        previous_rate = candidate_rate
+        previous_value = candidate_value
+    return None
+
+
+def calculate_account_xirr(
+    trades: pd.DataFrame,
+    valuation_date: date,
+    ending_value: float,
+) -> float | None:
+    investor_flows = [
+        (flow_date, -amount)
+        for flow_date, amount in external_cash_flows(trades, valuation_date)
+    ]
+    investor_flows.append((valuation_date, ending_value))
+    return calculate_xirr(investor_flows)
+
+
+def build_cash_flow_benchmark(
+    trades: pd.DataFrame,
+    valuation_date: date,
+    cash_flow_quotes: dict[date, PriceQuote],
+    end_quote: PriceQuote | None,
+) -> CashFlowBenchmark | None:
+    flows = external_cash_flows(trades, valuation_date)
+    if not flows or end_quote is None:
+        return None
+
+    units = 0.0
+    investor_flows = []
+    net_cash_flow = 0.0
+    for flow_date, amount in flows:
+        quote = cash_flow_quotes.get(flow_date)
+        if quote is None or quote.price <= 0:
+            return None
+        units += amount / quote.price
+        net_cash_flow += amount
+        investor_flows.append((flow_date, -amount))
+
+    ending_value = units * end_quote.price
+    pnl = ending_value - net_cash_flow
+    return_base = net_cash_flow if net_cash_flow > 1e-9 else None
+    return_pct = pnl / return_base if return_base else None
+    investor_flows.append((valuation_date, ending_value))
+    return CashFlowBenchmark(
+        ending_value=ending_value,
+        pnl=pnl,
+        return_pct=return_pct,
+        money_weighted_return_pct=calculate_xirr(investor_flows),
+    )
+
+
 def process_trades_until(
     trades: pd.DataFrame,
     through_date: date,
@@ -604,6 +777,7 @@ def build_account_report(
     ytd_start_date: date,
     benchmark_start_quote: PriceQuote | None,
     benchmark_end_quote: PriceQuote | None,
+    benchmark_cash_flow_quotes: dict[date, PriceQuote],
 ) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
@@ -618,12 +792,19 @@ def build_account_report(
             invested_capital=0.0,
             net_cash_flow=0.0,
             cash_balance=0.0,
+            ending_value=0.0,
             return_pct=None,
             annualized_return_pct=None,
+            money_weighted_return_pct=None,
             benchmark_start_price=None,
             benchmark_end_price=None,
             benchmark_return_pct=None,
             relative_to_benchmark_pct=None,
+            matched_benchmark_ending_value=None,
+            matched_benchmark_pnl=None,
+            matched_benchmark_return_pct=None,
+            matched_benchmark_money_weighted_return_pct=None,
+            relative_money_weighted_return_pct=None,
             ytd_total_pnl=None,
             first_trade_date=None,
             last_valuation_date=None,
@@ -631,14 +812,25 @@ def build_account_report(
 
     valuation_date = prices.index[0].date()
     last_price_row = prices.iloc[0]
-    realized, unrealized, invested, open_qty, open_cost, _ = process_trades_until(
-        trades, valuation_date, last_price_row
-    )
+    (
+        realized,
+        unrealized,
+        invested,
+        open_qty,
+        open_cost,
+        market_value,
+    ) = process_trades_until(trades, valuation_date, last_price_row)
     net_cash_flow, cash_balance = calculate_cash_metrics(trades, valuation_date)
+    ending_value = cash_balance + market_value
     total_pnl = realized + unrealized
     return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
     return_pct = total_pnl / return_base if return_base else None
     annualized_return_pct = annualize(return_pct, first_trade, valuation_date)
+    money_weighted_return_pct = calculate_account_xirr(
+        trades,
+        valuation_date,
+        ending_value,
+    )
     benchmark_return_pct = calculate_benchmark_return(
         benchmark_start_quote,
         benchmark_end_quote,
@@ -646,6 +838,21 @@ def build_account_report(
     relative_to_benchmark_pct = (
         return_pct - benchmark_return_pct
         if return_pct is not None and benchmark_return_pct is not None
+        else None
+    )
+    matched_benchmark = build_cash_flow_benchmark(
+        trades,
+        valuation_date,
+        benchmark_cash_flow_quotes,
+        benchmark_end_quote,
+    )
+    matched_benchmark_xirr = (
+        matched_benchmark.money_weighted_return_pct if matched_benchmark else None
+    )
+    relative_money_weighted_return_pct = (
+        money_weighted_return_pct - matched_benchmark_xirr
+        if money_weighted_return_pct is not None
+        and matched_benchmark_xirr is not None
         else None
     )
     ytd_total_pnl = calculate_ytd_total_pnl(
@@ -666,8 +873,10 @@ def build_account_report(
         invested_capital=invested,
         net_cash_flow=net_cash_flow,
         cash_balance=cash_balance,
+        ending_value=ending_value,
         return_pct=return_pct,
         annualized_return_pct=annualized_return_pct,
+        money_weighted_return_pct=money_weighted_return_pct,
         benchmark_start_price=(
             benchmark_start_quote.price if benchmark_start_quote else None
         ),
@@ -676,6 +885,15 @@ def build_account_report(
         ),
         benchmark_return_pct=benchmark_return_pct,
         relative_to_benchmark_pct=relative_to_benchmark_pct,
+        matched_benchmark_ending_value=(
+            matched_benchmark.ending_value if matched_benchmark else None
+        ),
+        matched_benchmark_pnl=(matched_benchmark.pnl if matched_benchmark else None),
+        matched_benchmark_return_pct=(
+            matched_benchmark.return_pct if matched_benchmark else None
+        ),
+        matched_benchmark_money_weighted_return_pct=matched_benchmark_xirr,
+        relative_money_weighted_return_pct=relative_money_weighted_return_pct,
         ytd_total_pnl=ytd_total_pnl,
         first_trade_date=first_trade,
         last_valuation_date=valuation_date,
@@ -749,6 +967,8 @@ def combine_reports(
     reports: list[AccountReport],
     benchmark_start_quote: PriceQuote | None,
     benchmark_end_quote: PriceQuote | None,
+    combined_trades: pd.DataFrame,
+    benchmark_cash_flow_quotes: dict[date, PriceQuote],
 ) -> dict[str, Any]:
     first_trade_dates = [
         report.first_trade_date for report in reports if report.first_trade_date
@@ -762,11 +982,30 @@ def combine_reports(
     invested = sum(report.invested_capital for report in reports)
     net_cash_flow = sum(report.net_cash_flow for report in reports)
     cash_balance = sum(report.cash_balance for report in reports)
+    ending_value = sum(report.ending_value for report in reports)
     return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
     return_pct = total_pnl / return_base if return_base else None
+    money_weighted_return_pct = (
+        calculate_account_xirr(combined_trades, last_date, ending_value)
+        if last_date
+        else None
+    )
     benchmark_return_pct = calculate_benchmark_return(
         benchmark_start_quote,
         benchmark_end_quote,
+    )
+    matched_benchmark = (
+        build_cash_flow_benchmark(
+            combined_trades,
+            last_date,
+            benchmark_cash_flow_quotes,
+            benchmark_end_quote,
+        )
+        if last_date
+        else None
+    )
+    matched_benchmark_xirr = (
+        matched_benchmark.money_weighted_return_pct if matched_benchmark else None
     )
 
     return {
@@ -776,8 +1015,10 @@ def combine_reports(
         "invested_capital": invested,
         "net_cash_flow": net_cash_flow,
         "cash_balance": cash_balance,
+        "ending_value": ending_value,
         "return_pct": return_pct,
         "annualized_return_pct": annualize(return_pct, first_trade, last_date),
+        "money_weighted_return_pct": money_weighted_return_pct,
         "benchmark_start_price": (
             benchmark_start_quote.price if benchmark_start_quote else None
         ),
@@ -788,6 +1029,22 @@ def combine_reports(
         "relative_to_benchmark_pct": (
             return_pct - benchmark_return_pct
             if return_pct is not None and benchmark_return_pct is not None
+            else None
+        ),
+        "matched_benchmark_ending_value": (
+            matched_benchmark.ending_value if matched_benchmark else None
+        ),
+        "matched_benchmark_pnl": (
+            matched_benchmark.pnl if matched_benchmark else None
+        ),
+        "matched_benchmark_return_pct": (
+            matched_benchmark.return_pct if matched_benchmark else None
+        ),
+        "matched_benchmark_money_weighted_return_pct": matched_benchmark_xirr,
+        "relative_money_weighted_return_pct": (
+            money_weighted_return_pct - matched_benchmark_xirr
+            if money_weighted_return_pct is not None
+            and matched_benchmark_xirr is not None
             else None
         ),
         "ytd_total_pnl": sum(
@@ -931,8 +1188,9 @@ def write_report(
         f"- Run date: {run_datetime.strftime('%Y-%m-%d %H:%M:%S')}",
         f"- Valuation date: {combined['last_valuation_date']}",
         "- Method: FIFO realized P&L; buy commissions are included in cost basis; sell commissions reduce proceeds.",
-        "- Return definition: total P&L divided by net cash flow when CASH rows exist; otherwise divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
-        f"- Benchmark definition: {BENCHMARK_SYMBOL} price return from the closest trading day on or before the first trade date through the valuation price. Relative return equals account return minus {BENCHMARK_SYMBOL} return.",
+        "- Return definition: total P&L divided by net cash flow when CASH rows exist; otherwise divided by cumulative buy cost including commissions. Simple annualized return uses calendar days from first trade to valuation date; XIRR is preferred when dated CASH flows are available.",
+        f"- Benchmark definition: {BENCHMARK_SYMBOL} price return from the closest trading day on or before the first trade date through the valuation price. Simple relative return equals account return minus {BENCHMARK_SYMBOL} return.",
+        f"- Cash-flow-matched benchmark: every CASH deposit buys fractional {BENCHMARK_SYMBOL} shares and every withdrawal sells shares at the closest price on or before that cash-flow date. Money-weighted returns use XIRR; relative XIRR equals account XIRR minus matched-{BENCHMARK_SYMBOL} XIRR.",
         "- YTD Total P&L definition: current total P&L minus total P&L as of the prior December 31.",
         "",
         "## Combined Accounts",
@@ -975,16 +1233,38 @@ def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
         ("Invested capital", money(getter("invested_capital"))),
         ("Net cash flow", money(getter("net_cash_flow"))),
         ("Cash balance", money(getter("cash_balance"))),
+        ("Ending account value", money(getter("ending_value"))),
         ("Realized P&L", money(getter("realized_pnl"))),
         ("Unrealized P&L", money(getter("unrealized_pnl"))),
         ("Total P&L", money(getter("total_pnl"))),
         ("YTD Total P&L", money(getter("ytd_total_pnl"))),
         ("Return", pct(getter("return_pct"))),
-        ("Annualized return", pct(getter("annualized_return_pct"))),
+        ("Simple annualized return", pct(getter("annualized_return_pct"))),
+        ("Money-weighted return (XIRR)", pct(getter("money_weighted_return_pct"))),
         (f"{BENCHMARK_SYMBOL} start price", money(getter("benchmark_start_price"))),
         (f"{BENCHMARK_SYMBOL} end price", money(getter("benchmark_end_price"))),
         (f"{BENCHMARK_SYMBOL} return", pct(getter("benchmark_return_pct"))),
-        (f"Relative to {BENCHMARK_SYMBOL}", pct(getter("relative_to_benchmark_pct"))),
+        (
+            f"Simple relative to {BENCHMARK_SYMBOL}",
+            pct(getter("relative_to_benchmark_pct")),
+        ),
+        (
+            f"Matched {BENCHMARK_SYMBOL} ending value",
+            money(getter("matched_benchmark_ending_value")),
+        ),
+        (f"Matched {BENCHMARK_SYMBOL} P&L", money(getter("matched_benchmark_pnl"))),
+        (
+            f"Matched {BENCHMARK_SYMBOL} return",
+            pct(getter("matched_benchmark_return_pct")),
+        ),
+        (
+            f"Matched {BENCHMARK_SYMBOL} XIRR",
+            pct(getter("matched_benchmark_money_weighted_return_pct")),
+        ),
+        (
+            f"Relative XIRR to {BENCHMARK_SYMBOL}",
+            pct(getter("relative_money_weighted_return_pct")),
+        ),
     ]
     df = pd.DataFrame(rows, columns=["Metric", name])
     return dataframe_to_markdown(df)
@@ -1073,20 +1353,24 @@ def main() -> int:
             if not trades.empty
         }
     )
+    cash_flow_dates = sorted(
+        {flow_date for flow_date, _ in external_cash_flows(all_trades, valuation_date)}
+    )
+    benchmark_quote_dates = sorted(set(first_trade_dates) | set(cash_flow_dates))
     benchmark_end_quote = quotes.get(BENCHMARK_SYMBOL)
-    benchmark_start_quotes = {
-        start_date: (
+    benchmark_historical_quotes = {
+        quote_date: (
             benchmark_end_quote
-            if start_date == valuation_date
+            if quote_date == valuation_date
             else fetch_historical_quote(
                 BENCHMARK_SYMBOL,
-                start_date,
+                quote_date,
                 api_key,
                 Path(args.cache_dir),
                 args.allow_cache_fallback,
             )
         )
-        for start_date in first_trade_dates
+        for quote_date in benchmark_quote_dates
     }
 
     missing_symbols = [symbol for symbol in symbols if symbol not in prices.columns]
@@ -1101,16 +1385,21 @@ def main() -> int:
             quotes,
             ytd_start_prices,
             ytd_start_date,
-            benchmark_start_quotes.get(trades["Date"].min()) if not trades.empty else None,
+            benchmark_historical_quotes.get(trades["Date"].min())
+            if not trades.empty
+            else None,
             benchmark_end_quote,
+            benchmark_historical_quotes,
         )
         for account, trades in trades_by_account.items()
     ]
     combined_first_trade = min(first_trade_dates) if first_trade_dates else None
     combined = combine_reports(
         reports,
-        benchmark_start_quotes.get(combined_first_trade),
+        benchmark_historical_quotes.get(combined_first_trade),
         benchmark_end_quote,
+        all_trades,
+        benchmark_historical_quotes,
     )
     write_report(output_path, workbook_path, reports, combined, run_datetime, quotes)
 
@@ -1120,6 +1409,15 @@ def main() -> int:
     print(f"Combined return: {pct(combined['return_pct'])}")
     print(f"{BENCHMARK_SYMBOL} return: {pct(combined['benchmark_return_pct'])}")
     print(f"Relative to {BENCHMARK_SYMBOL}: {pct(combined['relative_to_benchmark_pct'])}")
+    print(f"Account XIRR: {pct(combined['money_weighted_return_pct'])}")
+    print(
+        f"Matched {BENCHMARK_SYMBOL} XIRR: "
+        f"{pct(combined['matched_benchmark_money_weighted_return_pct'])}"
+    )
+    print(
+        f"Relative XIRR to {BENCHMARK_SYMBOL}: "
+        f"{pct(combined['relative_money_weighted_return_pct'])}"
+    )
     return 0
 
 
