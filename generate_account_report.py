@@ -40,6 +40,7 @@ SHEETS = {
 
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]
 CASH_SYMBOL = "CASH"
+BENCHMARK_SYMBOL = "VOO"
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -70,6 +71,10 @@ class AccountReport:
     cash_balance: float
     return_pct: float | None
     annualized_return_pct: float | None
+    benchmark_start_price: float | None
+    benchmark_end_price: float | None
+    benchmark_return_pct: float | None
+    relative_to_benchmark_pct: float | None
     ytd_total_pnl: float | None
     first_trade_date: date | None
     last_valuation_date: date | None
@@ -90,8 +95,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        default="/Users/chandlerqian/Downloads/James trade record.xlsx",
-        help="Path to the trade record workbook.",
+        default="James_Trade_Records.xlsx",
+        help=(
+            "Path to the trade record workbook. "
+            "Defaults to James_Trade_Records.xlsx in the current directory."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -594,6 +602,8 @@ def build_account_report(
     quotes: dict[str, PriceQuote],
     ytd_start_prices: pd.DataFrame,
     ytd_start_date: date,
+    benchmark_start_quote: PriceQuote | None,
+    benchmark_end_quote: PriceQuote | None,
 ) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
@@ -610,6 +620,10 @@ def build_account_report(
             cash_balance=0.0,
             return_pct=None,
             annualized_return_pct=None,
+            benchmark_start_price=None,
+            benchmark_end_price=None,
+            benchmark_return_pct=None,
+            relative_to_benchmark_pct=None,
             ytd_total_pnl=None,
             first_trade_date=None,
             last_valuation_date=None,
@@ -625,6 +639,15 @@ def build_account_report(
     return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
     return_pct = total_pnl / return_base if return_base else None
     annualized_return_pct = annualize(return_pct, first_trade, valuation_date)
+    benchmark_return_pct = calculate_benchmark_return(
+        benchmark_start_quote,
+        benchmark_end_quote,
+    )
+    relative_to_benchmark_pct = (
+        return_pct - benchmark_return_pct
+        if return_pct is not None and benchmark_return_pct is not None
+        else None
+    )
     ytd_total_pnl = calculate_ytd_total_pnl(
         trades,
         ytd_start_date,
@@ -645,6 +668,14 @@ def build_account_report(
         cash_balance=cash_balance,
         return_pct=return_pct,
         annualized_return_pct=annualized_return_pct,
+        benchmark_start_price=(
+            benchmark_start_quote.price if benchmark_start_quote else None
+        ),
+        benchmark_end_price=(
+            benchmark_end_quote.price if benchmark_end_quote else None
+        ),
+        benchmark_return_pct=benchmark_return_pct,
+        relative_to_benchmark_pct=relative_to_benchmark_pct,
         ytd_total_pnl=ytd_total_pnl,
         first_trade_date=first_trade,
         last_valuation_date=valuation_date,
@@ -705,7 +736,20 @@ def annualize(return_pct: float | None, start: date | None, end: date | None) ->
     return (1 + return_pct) ** (365 / days) - 1
 
 
-def combine_reports(reports: list[AccountReport]) -> dict[str, Any]:
+def calculate_benchmark_return(
+    start_quote: PriceQuote | None,
+    end_quote: PriceQuote | None,
+) -> float | None:
+    if start_quote is None or end_quote is None or start_quote.price <= 0:
+        return None
+    return end_quote.price / start_quote.price - 1
+
+
+def combine_reports(
+    reports: list[AccountReport],
+    benchmark_start_quote: PriceQuote | None,
+    benchmark_end_quote: PriceQuote | None,
+) -> dict[str, Any]:
     first_trade_dates = [
         report.first_trade_date for report in reports if report.first_trade_date
     ]
@@ -720,6 +764,10 @@ def combine_reports(reports: list[AccountReport]) -> dict[str, Any]:
     cash_balance = sum(report.cash_balance for report in reports)
     return_base = net_cash_flow if net_cash_flow > 1e-9 else invested
     return_pct = total_pnl / return_base if return_base else None
+    benchmark_return_pct = calculate_benchmark_return(
+        benchmark_start_quote,
+        benchmark_end_quote,
+    )
 
     return {
         "realized_pnl": sum(report.realized_pnl for report in reports),
@@ -730,6 +778,18 @@ def combine_reports(reports: list[AccountReport]) -> dict[str, Any]:
         "cash_balance": cash_balance,
         "return_pct": return_pct,
         "annualized_return_pct": annualize(return_pct, first_trade, last_date),
+        "benchmark_start_price": (
+            benchmark_start_quote.price if benchmark_start_quote else None
+        ),
+        "benchmark_end_price": (
+            benchmark_end_quote.price if benchmark_end_quote else None
+        ),
+        "benchmark_return_pct": benchmark_return_pct,
+        "relative_to_benchmark_pct": (
+            return_pct - benchmark_return_pct
+            if return_pct is not None and benchmark_return_pct is not None
+            else None
+        ),
         "ytd_total_pnl": sum(
             report.ytd_total_pnl for report in reports
             if report.ytd_total_pnl is not None
@@ -872,6 +932,7 @@ def write_report(
         f"- Valuation date: {combined['last_valuation_date']}",
         "- Method: FIFO realized P&L; buy commissions are included in cost basis; sell commissions reduce proceeds.",
         "- Return definition: total P&L divided by net cash flow when CASH rows exist; otherwise divided by cumulative buy cost including commissions. Annualized return uses calendar days from first trade to valuation date.",
+        f"- Benchmark definition: {BENCHMARK_SYMBOL} price return from the closest trading day on or before the first trade date through the valuation price. Relative return equals account return minus {BENCHMARK_SYMBOL} return.",
         "- YTD Total P&L definition: current total P&L minus total P&L as of the prior December 31.",
         "",
         "## Combined Accounts",
@@ -920,6 +981,10 @@ def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
         ("YTD Total P&L", money(getter("ytd_total_pnl"))),
         ("Return", pct(getter("return_pct"))),
         ("Annualized return", pct(getter("annualized_return_pct"))),
+        (f"{BENCHMARK_SYMBOL} start price", money(getter("benchmark_start_price"))),
+        (f"{BENCHMARK_SYMBOL} end price", money(getter("benchmark_end_price"))),
+        (f"{BENCHMARK_SYMBOL} return", pct(getter("benchmark_return_pct"))),
+        (f"Relative to {BENCHMARK_SYMBOL}", pct(getter("relative_to_benchmark_pct"))),
     ]
     df = pd.DataFrame(rows, columns=["Metric", name])
     return dataframe_to_markdown(df)
@@ -946,10 +1011,11 @@ def main() -> int:
         symbol for symbol, qty in combined_open_qty.items()
         if abs(qty) > 1e-9 and not is_cash_symbol(symbol)
     )
+    quote_symbols = sorted(set(symbols) | {BENCHMARK_SYMBOL})
 
     if requested_as_of is None:
         quotes = load_latest_prices(
-            symbols=symbols,
+            symbols=quote_symbols,
             api_key=api_key,
             cache_dir=Path(args.cache_dir),
             allow_cache_fallback=args.allow_cache_fallback,
@@ -957,7 +1023,7 @@ def main() -> int:
         valuation_date = valuation_date_from_quotes(quotes, date.today())
     else:
         quotes = load_historical_prices(
-            symbols=symbols,
+            symbols=quote_symbols,
             target_date=requested_as_of,
             api_key=api_key,
             cache_dir=Path(args.cache_dir),
@@ -971,8 +1037,9 @@ def main() -> int:
         )
         if final_symbols != symbols:
             symbols = final_symbols
+            quote_symbols = sorted(set(symbols) | {BENCHMARK_SYMBOL})
             quotes = load_historical_prices(
-                symbols=symbols,
+                symbols=quote_symbols,
                 target_date=valuation_date,
                 api_key=api_key,
                 cache_dir=Path(args.cache_dir),
@@ -999,6 +1066,29 @@ def main() -> int:
     )
     ytd_start_prices = quotes_to_price_frame(ytd_start_quotes, ytd_start_date)
 
+    first_trade_dates = sorted(
+        {
+            trades["Date"].min()
+            for trades in trades_by_account.values()
+            if not trades.empty
+        }
+    )
+    benchmark_end_quote = quotes.get(BENCHMARK_SYMBOL)
+    benchmark_start_quotes = {
+        start_date: (
+            benchmark_end_quote
+            if start_date == valuation_date
+            else fetch_historical_quote(
+                BENCHMARK_SYMBOL,
+                start_date,
+                api_key,
+                Path(args.cache_dir),
+                args.allow_cache_fallback,
+            )
+        )
+        for start_date in first_trade_dates
+    }
+
     missing_symbols = [symbol for symbol in symbols if symbol not in prices.columns]
     if missing_symbols:
         raise RuntimeError(f"Missing latest prices for symbols: {missing_symbols}")
@@ -1011,16 +1101,25 @@ def main() -> int:
             quotes,
             ytd_start_prices,
             ytd_start_date,
+            benchmark_start_quotes.get(trades["Date"].min()) if not trades.empty else None,
+            benchmark_end_quote,
         )
         for account, trades in trades_by_account.items()
     ]
-    combined = combine_reports(reports)
+    combined_first_trade = min(first_trade_dates) if first_trade_dates else None
+    combined = combine_reports(
+        reports,
+        benchmark_start_quotes.get(combined_first_trade),
+        benchmark_end_quote,
+    )
     write_report(output_path, workbook_path, reports, combined, run_datetime, quotes)
 
     print(f"Wrote report to {output_path}")
     print(f"Accounts: {', '.join(report.account for report in reports)}")
     print(f"Combined total P&L: {money(combined['total_pnl'])}")
     print(f"Combined return: {pct(combined['return_pct'])}")
+    print(f"{BENCHMARK_SYMBOL} return: {pct(combined['benchmark_return_pct'])}")
+    print(f"Relative to {BENCHMARK_SYMBOL}: {pct(combined['relative_to_benchmark_pct'])}")
     return 0
 
 

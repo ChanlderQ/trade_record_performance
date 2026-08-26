@@ -15,6 +15,8 @@ It calculates separate account reports and a combined report, including:
 - YTD total P&L versus the prior December 31
 - return
 - annualized return
+- concurrent VOO price return from the account's first trade date
+- return relative to VOO, calculated as account return minus VOO return
 - net cash flow and cash balance when `CASH` rows are present
 - per-account open positions
 - combined open positions
@@ -44,9 +46,18 @@ first when a key is available.
 
 ## Usage
 
+By default, the script reads `James_Trade_Records.xlsx` from the current
+directory, so it can be run without specifying an input path:
+
+```bash
+python3 generate_account_report.py
+```
+
+To use a different workbook or generate an as-of report:
+
 ```bash
 python3 generate_account_report.py \
-  --input "/path/to/James trade record.xlsx" \
+  --input "/path/to/trade_records.xlsx" \
   --as-of 2026-07-02
 ```
 
@@ -136,3 +147,7 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - When `CASH` rows exist, return is total P&L divided by net cash flow.
   Without `CASH` rows, return is total P&L divided by cumulative buy cost.
 - Annualized return uses calendar days from first trade to valuation date.
+- The VOO benchmark uses the closing price from the closest trading day on or
+  before the account's first trade date and the report's valuation price. The
+  combined-account comparison starts on the earliest first trade date across
+  all accounts. Relative return is the account return minus the VOO return.
