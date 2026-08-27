@@ -90,5 +90,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: account-report-${{ github.run_id }}
-          path: reports/account_report_*.md
+          path: |
+            reports/account_report_*.md
+            reports/account_report_*_nav.svg
           if-no-files-found: error

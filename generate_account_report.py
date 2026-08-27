@@ -12,6 +12,7 @@ no API key or a quote request fails, Yahoo Finance is used as a fallback.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
 import os
@@ -41,6 +42,7 @@ SHEETS = {
 REQUIRED_COLUMNS = ["Date", "Symbol", "Price", "Qty", "Comm Fee", "Trade Value"]
 CASH_SYMBOL = "CASH"
 BENCHMARK_SYMBOL = "VOO"
+TRADING_DAYS_PER_YEAR = 252
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -73,6 +75,9 @@ class AccountReport:
     return_pct: float | None
     annualized_return_pct: float | None
     money_weighted_return_pct: float | None
+    time_weighted_return_pct: float | None
+    max_drawdown_pct: float | None
+    sharpe_ratio: float | None
     benchmark_start_price: float | None
     benchmark_end_price: float | None
     benchmark_return_pct: float | None
@@ -102,6 +107,14 @@ class CashFlowBenchmark:
     pnl: float
     return_pct: float | None
     money_weighted_return_pct: float | None
+
+
+@dataclass
+class DailyPerformance:
+    history: pd.DataFrame
+    time_weighted_return_pct: float | None
+    max_drawdown_pct: float | None
+    sharpe_ratio: float | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,6 +163,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use cached prices only if both FMP and Yahoo live quote requests fail.",
     )
+    parser.add_argument(
+        "--risk-free-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Annual risk-free rate used for the Sharpe ratio, expressed as a "
+            "decimal. Defaults to 0.0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -188,6 +210,12 @@ def pct(value: float | None) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "n/a"
     return f"{value:.2%}"
+
+
+def ratio(value: float | None) -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "n/a"
+    return f"{value:.2f}"
 
 
 def read_trades(workbook_path: Path) -> dict[str, pd.DataFrame]:
@@ -419,6 +447,147 @@ def fetch_yahoo_historical_quote(symbol: str, target_date: date) -> PriceQuote:
     )
 
 
+def fetch_fmp_historical_series(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    api_key: str | None,
+) -> dict[date, float]:
+    if not api_key:
+        raise RuntimeError("FMP API key is not set")
+
+    query = urlencode(
+        {
+            "symbol": symbol,
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat(),
+            "apikey": api_key,
+        }
+    )
+    url = f"{FMP_HISTORY_URL}?{query}"
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"FMP historical-series HTTP error for {symbol}: {exc.code} {exc.reason}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"FMP historical-series network error for {symbol}: {exc.reason}"
+        ) from exc
+
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"FMP returned no historical series for {symbol}")
+    prices = {
+        pd.to_datetime(item["date"]).date(): float(item["close"])
+        for item in payload
+        if item.get("date") and item.get("close") is not None
+    }
+    if not prices:
+        raise RuntimeError(f"FMP historical series for {symbol} had no closing prices")
+    return prices
+
+
+def fetch_yahoo_historical_series(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+) -> dict[date, float]:
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+    query = urlencode(
+        {
+            "period1": int(start_dt.timestamp()),
+            "period2": int(end_dt.timestamp()),
+            "interval": "1d",
+        }
+    )
+    url = f"{YAHOO_CHART_URL.format(symbol=symbol)}?{query}"
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(
+            f"Yahoo Finance historical-series HTTP error for {symbol}: "
+            f"{exc.code} {exc.reason}"
+        ) from exc
+    except URLError as exc:
+        raise RuntimeError(
+            f"Yahoo Finance historical-series network error for {symbol}: {exc.reason}"
+        ) from exc
+
+    chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+    error = chart.get("error")
+    if error:
+        raise RuntimeError(f"Yahoo Finance historical-series error for {symbol}: {error}")
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"Yahoo Finance returned no historical series for {symbol}")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    closes = result.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+    prices = {
+        datetime.fromtimestamp(int(timestamp)).date(): float(close)
+        for timestamp, close in zip(timestamps, closes)
+        if close is not None
+    }
+    if not prices:
+        raise RuntimeError(
+            f"Yahoo Finance historical series for {symbol} had no closing prices"
+        )
+    return prices
+
+
+def fetch_historical_series(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    api_key: str | None,
+    cache_dir: Path,
+    allow_cache_fallback: bool,
+) -> dict[date, float]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / (
+        f"{symbol}_{start_date.isoformat()}_{end_date.isoformat()}_series.json"
+    )
+
+    errors = []
+    try:
+        prices = fetch_fmp_historical_series(symbol, start_date, end_date, api_key)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        try:
+            prices = fetch_yahoo_historical_series(symbol, start_date, end_date)
+        except RuntimeError as yahoo_exc:
+            errors.append(str(yahoo_exc))
+            if cache_file.exists() and allow_cache_fallback:
+                cached = json.loads(cache_file.read_text())
+                return {
+                    pd.to_datetime(row["date"]).date(): float(row["price"])
+                    for row in cached["prices"]
+                }
+            raise RuntimeError(
+                f"Could not fetch historical series for {symbol}: {'; '.join(errors)}"
+            ) from yahoo_exc
+
+    cache_file.write_text(
+        json.dumps(
+            {
+                "symbol": symbol,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "prices": [
+                    {"date": price_date.isoformat(), "price": price}
+                    for price_date, price in sorted(prices.items())
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return prices
+
+
 def fetch_latest_quote(
     symbol: str,
     api_key: str | None,
@@ -501,6 +670,27 @@ def load_historical_prices(
         symbol: fetch_historical_quote(
             symbol,
             target_date,
+            api_key,
+            cache_dir,
+            allow_cache_fallback,
+        )
+        for symbol in symbols
+    }
+
+
+def load_historical_series(
+    symbols: list[str],
+    start_date: date,
+    end_date: date,
+    api_key: str | None,
+    cache_dir: Path,
+    allow_cache_fallback: bool,
+) -> dict[str, dict[date, float]]:
+    return {
+        symbol: fetch_historical_series(
+            symbol,
+            start_date,
+            end_date,
             api_key,
             cache_dir,
             allow_cache_fallback,
@@ -743,6 +933,340 @@ def build_cash_flow_benchmark(
     )
 
 
+def calculate_performance_metrics(
+    history: pd.DataFrame,
+    annual_risk_free_rate: float,
+) -> DailyPerformance:
+    if history.empty:
+        return DailyPerformance(history, None, None, None)
+
+    time_weighted_return_pct = float(history["TWR Index"].iloc[-1] / 100 - 1)
+    running_peak = history["TWR Index"].cummax()
+    drawdowns = history["TWR Index"] / running_peak - 1
+    max_drawdown_pct = float(drawdowns.min())
+
+    trading_returns = history.loc[
+        history["Trading Day"],
+        "Daily Return",
+    ]
+    sharpe_ratio = None
+    if len(trading_returns) >= 2:
+        daily_risk_free_rate = (
+            (1 + annual_risk_free_rate) ** (1 / TRADING_DAYS_PER_YEAR) - 1
+        )
+        excess_returns = trading_returns - daily_risk_free_rate
+        volatility = float(excess_returns.std(ddof=1))
+        if volatility > 1e-12:
+            sharpe_ratio = (
+                float(excess_returns.mean())
+                / volatility
+                * math.sqrt(TRADING_DAYS_PER_YEAR)
+            )
+
+    return DailyPerformance(
+        history=history,
+        time_weighted_return_pct=time_weighted_return_pct,
+        max_drawdown_pct=max_drawdown_pct,
+        sharpe_ratio=sharpe_ratio,
+    )
+
+
+def build_daily_performance(
+    trades: pd.DataFrame,
+    valuation_date: date,
+    price_history: dict[str, dict[date, float]],
+    annual_risk_free_rate: float,
+) -> DailyPerformance:
+    eligible_trades = trades[trades["Date"] <= valuation_date].copy()
+    if eligible_trades.empty:
+        return DailyPerformance(pd.DataFrame(), None, None, None)
+
+    start_date = eligible_trades["Date"].min()
+    benchmark_dates = {
+        price_date
+        for price_date in price_history.get(BENCHMARK_SYMBOL, {})
+        if start_date <= price_date <= valuation_date
+    }
+    transaction_dates = set(eligible_trades["Date"])
+    valuation_dates = sorted(
+        benchmark_dates | transaction_dates | {start_date, valuation_date}
+    )
+
+    price_frame = pd.DataFrame(
+        {
+            symbol: pd.Series(prices, dtype=float)
+            for symbol, prices in price_history.items()
+        }
+    ).sort_index()
+    price_frame = price_frame.reindex(valuation_dates).ffill()
+
+    trades_by_date = {
+        trade_date: rows
+        for trade_date, rows in eligible_trades.groupby("Date", sort=True)
+    }
+    quantities: dict[str, float] = defaultdict(float)
+    cash_balance = 0.0
+    previous_value: float | None = None
+    twr_index = 100.0
+    rows = []
+
+    for valuation_day in valuation_dates:
+        external_flow = 0.0
+        for _, trade in trades_by_date.get(
+            valuation_day,
+            pd.DataFrame(),
+        ).iterrows():
+            symbol = trade["Symbol"]
+            qty = float(trade["Qty"])
+            trade_price = float(trade["Price"])
+            fee = float(trade["Comm Fee"])
+            if is_cash_symbol(symbol):
+                flow = qty * trade_price - fee
+                cash_balance += flow
+                external_flow += flow
+            else:
+                cash_balance -= qty * trade_price + fee
+                quantities[symbol] += qty
+
+        market_value = 0.0
+        for symbol, qty in quantities.items():
+            if abs(qty) <= 1e-9:
+                continue
+            if symbol not in price_frame.columns:
+                raise RuntimeError(f"No daily price history for {symbol}")
+            price = price_frame.at[valuation_day, symbol]
+            if pd.isna(price):
+                raise RuntimeError(
+                    f"No daily price for {symbol} on or before {valuation_day}"
+                )
+            market_value += qty * float(price)
+
+        ending_value = cash_balance + market_value
+        if previous_value is None:
+            if external_flow <= 1e-9:
+                raise RuntimeError(
+                    f"Cannot start TWR on {valuation_day}: a positive initial "
+                    "CASH contribution is required"
+                )
+            daily_return = (ending_value - external_flow) / external_flow
+            twr_index *= 1 + daily_return
+        else:
+            return_base = previous_value + external_flow
+            if return_base <= 1e-9:
+                raise RuntimeError(
+                    f"Cannot calculate TWR on {valuation_day}: beginning value plus "
+                    f"external cash flow is not positive"
+                )
+            daily_return = (ending_value - previous_value - external_flow) / return_base
+            twr_index *= 1 + daily_return
+
+        rows.append(
+            {
+                "Date": valuation_day,
+                "Cash Flow": external_flow,
+                "Cash Balance": cash_balance,
+                "Market Value": market_value,
+                "Ending Value": ending_value,
+                "Daily Return": daily_return,
+                "TWR Index": twr_index,
+                "Trading Day": valuation_day in benchmark_dates,
+            }
+        )
+        previous_value = ending_value
+
+    history = pd.DataFrame(rows).set_index("Date")
+    return calculate_performance_metrics(history, annual_risk_free_rate)
+
+
+def build_benchmark_curve(
+    prices: dict[date, float],
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    dated_prices = sorted(
+        (price_date, price)
+        for price_date, price in prices.items()
+        if price_date <= end_date
+    )
+    start_price = latest_price_on_or_before(dated_prices, start_date)
+    if start_price is None:
+        return pd.DataFrame()
+    start_price_date, base_price = start_price
+    rows = [
+        {
+            "Date": price_date,
+            "TWR Index": price / base_price * 100,
+        }
+        for price_date, price in dated_prices
+        if start_price_date <= price_date <= end_date
+    ]
+    return pd.DataFrame(rows).set_index("Date")
+
+
+def build_excess_return_curve(
+    account_curve: pd.DataFrame,
+    benchmark_curve: pd.DataFrame,
+) -> pd.DataFrame:
+    if account_curve.empty or benchmark_curve.empty:
+        return pd.DataFrame()
+    combined_index = account_curve.index.union(benchmark_curve.index).sort_values()
+    benchmark_aligned = (
+        benchmark_curve["TWR Index"]
+        .reindex(combined_index)
+        .ffill()
+        .reindex(account_curve.index)
+    )
+    excess_return = (
+        account_curve["TWR Index"] / 100 - benchmark_aligned / 100
+    ).dropna()
+    return pd.DataFrame({"Excess Return": excess_return})
+
+
+def write_nav_chart(
+    output_path: Path,
+    curves: dict[str, pd.DataFrame],
+    excess_return_curve: pd.DataFrame | None = None,
+) -> None:
+    usable_curves = {
+        name: curve.dropna(subset=["TWR Index"])
+        for name, curve in curves.items()
+        if not curve.empty
+    }
+    usable_curves = {name: curve for name, curve in usable_curves.items() if not curve.empty}
+    if not usable_curves:
+        return
+
+    usable_excess = (
+        excess_return_curve.dropna(subset=["Excess Return"])
+        if excess_return_curve is not None and not excess_return_curve.empty
+        else pd.DataFrame()
+    )
+
+    width, height = 1000, 540
+    left, right, top, bottom = 82, 110, 64, 70
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    all_dates = [curve.index.min() for curve in usable_curves.values()] + [
+        curve.index.max() for curve in usable_curves.values()
+    ]
+    min_date, max_date = min(all_dates), max(all_dates)
+    date_span = max((max_date - min_date).days, 1)
+    all_values = [
+        float(value)
+        for curve in usable_curves.values()
+        for value in curve["TWR Index"].tolist()
+    ]
+    min_value, max_value = min(all_values), max(all_values)
+    value_span = max(max_value - min_value, 1.0)
+    padding = value_span * 0.08
+    y_min = min_value - padding
+    y_max = max_value + padding
+
+    def x_position(value_date: date) -> float:
+        return left + (value_date - min_date).days / date_span * plot_width
+
+    def y_position(value: float) -> float:
+        return top + (y_max - value) / (y_max - y_min) * plot_height
+
+    excess_y_min = excess_y_max = None
+    if not usable_excess.empty:
+        excess_min = float(usable_excess["Excess Return"].min())
+        excess_max = float(usable_excess["Excess Return"].max())
+        excess_span = max(excess_max - excess_min, 0.01)
+        excess_padding = excess_span * 0.08
+        excess_y_min = excess_min - excess_padding
+        excess_y_max = excess_max + excess_padding
+
+    def excess_y_position(value: float) -> float:
+        if excess_y_min is None or excess_y_max is None:
+            raise ValueError("Excess-return axis is not available")
+        return top + (excess_y_max - value) / (excess_y_max - excess_y_min) * plot_height
+
+    colors = ["#2563eb", "#16a34a", "#f97316", "#7c3aed", "#dc2626"]
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="82" y="34" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">TWR Net Value and Excess Return</text>',
+        f'<text x="{left}" y="52" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Net value (left axis, initial capital = 100)</text>',
+    ]
+
+    for tick in range(6):
+        tick_value = y_min + (y_max - y_min) * tick / 5
+        y = y_position(tick_value)
+        svg.append(
+            f'<line x1="{left}" y1="{y:.2f}" x2="{width-right}" y2="{y:.2f}" stroke="#e5e7eb" stroke-width="1"/>'
+        )
+        svg.append(
+            f'<text x="{left-10}" y="{y+4:.2f}" text-anchor="end" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">{tick_value:.1f}</text>'
+        )
+
+    for tick in range(5):
+        tick_date = min_date + timedelta(days=round(date_span * tick / 4))
+        x = x_position(tick_date)
+        anchor = "start" if tick == 0 else "end" if tick == 4 else "middle"
+        svg.append(
+            f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{height-bottom}" stroke="#f3f4f6" stroke-width="1"/>'
+        )
+        svg.append(
+            f'<text x="{x:.2f}" y="{height-bottom+24}" text-anchor="{anchor}" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">{tick_date.isoformat()}</text>'
+        )
+
+    if excess_y_min is not None and excess_y_max is not None:
+        svg.append(
+            f'<text x="{width-right}" y="52" text-anchor="end" font-family="Arial, sans-serif" font-size="12" fill="#dc2626">Cumulative excess return (right axis)</text>'
+        )
+        for tick in range(6):
+            tick_value = excess_y_min + (excess_y_max - excess_y_min) * tick / 5
+            y = excess_y_position(tick_value)
+            svg.append(
+                f'<line x1="{width-right}" y1="{y:.2f}" x2="{width-right+5}" y2="{y:.2f}" stroke="#dc2626" stroke-width="1"/>'
+            )
+            svg.append(
+                f'<text x="{width-right+10}" y="{y+4:.2f}" text-anchor="start" font-family="Arial, sans-serif" font-size="12" fill="#dc2626">{tick_value:.1%}</text>'
+            )
+        if excess_y_min <= 0 <= excess_y_max:
+            zero_y = excess_y_position(0)
+            svg.append(
+                f'<line x1="{left}" y1="{zero_y:.2f}" x2="{width-right}" y2="{zero_y:.2f}" stroke="#fecaca" stroke-width="1" stroke-dasharray="4 4"/>'
+            )
+
+    for index, (name, curve) in enumerate(usable_curves.items()):
+        color = colors[index % len(colors)]
+        points = " ".join(
+            f"{x_position(curve_date):.2f},{y_position(float(value)):.2f}"
+            for curve_date, value in curve["TWR Index"].items()
+        )
+        svg.append(
+            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        legend_x = left + index * 170
+        svg.append(
+            f'<line x1="{legend_x}" y1="{height-18}" x2="{legend_x+26}" y2="{height-18}" stroke="{color}" stroke-width="3"/>'
+        )
+        svg.append(
+            f'<text x="{legend_x+34}" y="{height-14}" font-family="Arial, sans-serif" font-size="13" fill="#374151">{html.escape(name)}</text>'
+        )
+
+    if not usable_excess.empty:
+        excess_points = " ".join(
+            f"{x_position(curve_date):.2f},{excess_y_position(float(value)):.2f}"
+            for curve_date, value in usable_excess["Excess Return"].items()
+        )
+        svg.append(
+            f'<polyline points="{excess_points}" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 5" stroke-linejoin="round" stroke-linecap="round"/>'
+        )
+        legend_x = left + len(usable_curves) * 170
+        svg.append(
+            f'<line x1="{legend_x}" y1="{height-18}" x2="{legend_x+26}" y2="{height-18}" stroke="#dc2626" stroke-width="3" stroke-dasharray="7 5"/>'
+        )
+        svg.append(
+            f'<text x="{legend_x+34}" y="{height-14}" font-family="Arial, sans-serif" font-size="13" fill="#374151">Excess return</text>'
+        )
+
+    svg.append("</svg>")
+    output_path.write_text("\n".join(svg))
+
+
 def process_trades_until(
     trades: pd.DataFrame,
     through_date: date,
@@ -778,6 +1302,7 @@ def build_account_report(
     benchmark_start_quote: PriceQuote | None,
     benchmark_end_quote: PriceQuote | None,
     benchmark_cash_flow_quotes: dict[date, PriceQuote],
+    daily_performance: DailyPerformance,
 ) -> AccountReport:
     first_trade = trades["Date"].min() if not trades.empty else None
 
@@ -796,6 +1321,9 @@ def build_account_report(
             return_pct=None,
             annualized_return_pct=None,
             money_weighted_return_pct=None,
+            time_weighted_return_pct=None,
+            max_drawdown_pct=None,
+            sharpe_ratio=None,
             benchmark_start_price=None,
             benchmark_end_price=None,
             benchmark_return_pct=None,
@@ -877,6 +1405,9 @@ def build_account_report(
         return_pct=return_pct,
         annualized_return_pct=annualized_return_pct,
         money_weighted_return_pct=money_weighted_return_pct,
+        time_weighted_return_pct=daily_performance.time_weighted_return_pct,
+        max_drawdown_pct=daily_performance.max_drawdown_pct,
+        sharpe_ratio=daily_performance.sharpe_ratio,
         benchmark_start_price=(
             benchmark_start_quote.price if benchmark_start_quote else None
         ),
@@ -969,6 +1500,7 @@ def combine_reports(
     benchmark_end_quote: PriceQuote | None,
     combined_trades: pd.DataFrame,
     benchmark_cash_flow_quotes: dict[date, PriceQuote],
+    daily_performance: DailyPerformance,
 ) -> dict[str, Any]:
     first_trade_dates = [
         report.first_trade_date for report in reports if report.first_trade_date
@@ -1019,6 +1551,9 @@ def combine_reports(
         "return_pct": return_pct,
         "annualized_return_pct": annualize(return_pct, first_trade, last_date),
         "money_weighted_return_pct": money_weighted_return_pct,
+        "time_weighted_return_pct": daily_performance.time_weighted_return_pct,
+        "max_drawdown_pct": daily_performance.max_drawdown_pct,
+        "sharpe_ratio": daily_performance.sharpe_ratio,
         "benchmark_start_price": (
             benchmark_start_quote.price if benchmark_start_quote else None
         ),
@@ -1180,6 +1715,8 @@ def write_report(
     combined: dict[str, Any],
     run_datetime: datetime,
     quotes: dict[str, PriceQuote],
+    nav_chart_path: Path | None,
+    annual_risk_free_rate: float,
 ) -> None:
     lines = [
         "# Account Performance Report",
@@ -1191,17 +1728,33 @@ def write_report(
         "- Return definition: total P&L divided by net cash flow when CASH rows exist; otherwise divided by cumulative buy cost including commissions. Simple annualized return uses calendar days from first trade to valuation date; XIRR is preferred when dated CASH flows are available.",
         f"- Benchmark definition: {BENCHMARK_SYMBOL} price return from the closest trading day on or before the first trade date through the valuation price. Simple relative return equals account return minus {BENCHMARK_SYMBOL} return.",
         f"- Cash-flow-matched benchmark: every CASH deposit buys fractional {BENCHMARK_SYMBOL} shares and every withdrawal sells shares at the closest price on or before that cash-flow date. Money-weighted returns use XIRR; relative XIRR equals account XIRR minus matched-{BENCHMARK_SYMBOL} XIRR.",
+        "- TWR definition: daily returns geometrically linked after removing CASH deposits and withdrawals, which are assumed to occur before that day's return period. The initial CASH contribution is the first day's return base.",
+        f"- Excess-return curve: combined-account cumulative TWR minus cumulative {BENCHMARK_SYMBOL} price return, shown as a percentage on the right axis.",
+        f"- Risk definition: maximum drawdown is measured from the TWR high-water mark. Sharpe ratio uses daily TWR returns, {TRADING_DAYS_PER_YEAR} trading days per year, and a {annual_risk_free_rate:.2%} annual risk-free rate.",
         "- YTD Total P&L definition: current total P&L minus total P&L as of the prior December 31.",
         "",
         "## Combined Accounts",
         "",
         summary_block("Combined", combined),
         "",
+    ]
+    if nav_chart_path is not None:
+        lines.extend(
+            [
+                "## TWR Net Value Curve",
+                "",
+                f"![TWR net value curve]({nav_chart_path.name})",
+                "",
+            ]
+        )
+    lines.extend(
+        [
         "### Combined Open Positions",
         "",
         markdown_table(combine_positions(reports)),
         "",
-    ]
+        ]
+    )
 
     for report in reports:
         lines.extend(
@@ -1241,6 +1794,9 @@ def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
         ("Return", pct(getter("return_pct"))),
         ("Simple annualized return", pct(getter("annualized_return_pct"))),
         ("Money-weighted return (XIRR)", pct(getter("money_weighted_return_pct"))),
+        ("Time-weighted return (TWR)", pct(getter("time_weighted_return_pct"))),
+        ("Maximum drawdown", pct(getter("max_drawdown_pct"))),
+        ("Sharpe ratio", ratio(getter("sharpe_ratio"))),
         (f"{BENCHMARK_SYMBOL} start price", money(getter("benchmark_start_price"))),
         (f"{BENCHMARK_SYMBOL} end price", money(getter("benchmark_end_price"))),
         (f"{BENCHMARK_SYMBOL} return", pct(getter("benchmark_return_pct"))),
@@ -1272,6 +1828,8 @@ def summary_block(name: str, obj: AccountReport | dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
+    if args.risk_free_rate <= -1:
+        raise ValueError("--risk-free-rate must be greater than -1.0")
     run_datetime = datetime.now()
     dotenv_path = Path(".env")
     api_key = get_api_key(args.api_key, dotenv_path)
@@ -1373,6 +1931,45 @@ def main() -> int:
         for quote_date in benchmark_quote_dates
     }
 
+    history_trades = all_trades[all_trades["Date"] <= valuation_date]
+    history_start_date = history_trades["Date"].min() - timedelta(days=10)
+    history_symbols = sorted(
+        set(
+            history_trades.loc[
+                ~history_trades["Symbol"].map(is_cash_symbol),
+                "Symbol",
+            ]
+        )
+        | {BENCHMARK_SYMBOL}
+    )
+    price_history = load_historical_series(
+        symbols=history_symbols,
+        start_date=history_start_date,
+        end_date=valuation_date,
+        api_key=api_key,
+        cache_dir=Path(args.cache_dir),
+        allow_cache_fallback=args.allow_cache_fallback,
+    )
+    for symbol, quote in quotes.items():
+        if symbol in price_history:
+            price_history[symbol][valuation_date] = quote.price
+
+    daily_performance_by_account = {
+        account: build_daily_performance(
+            trades,
+            valuation_date,
+            price_history,
+            args.risk_free_rate,
+        )
+        for account, trades in trades_by_account.items()
+    }
+    combined_daily_performance = build_daily_performance(
+        all_trades,
+        valuation_date,
+        price_history,
+        args.risk_free_rate,
+    )
+
     missing_symbols = [symbol for symbol in symbols if symbol not in prices.columns]
     if missing_symbols:
         raise RuntimeError(f"Missing latest prices for symbols: {missing_symbols}")
@@ -1390,6 +1987,7 @@ def main() -> int:
             else None,
             benchmark_end_quote,
             benchmark_historical_quotes,
+            daily_performance_by_account[account],
         )
         for account, trades in trades_by_account.items()
     ]
@@ -1400,8 +1998,38 @@ def main() -> int:
         benchmark_end_quote,
         all_trades,
         benchmark_historical_quotes,
+        combined_daily_performance,
     )
-    write_report(output_path, workbook_path, reports, combined, run_datetime, quotes)
+    nav_chart_path = output_path.with_name(f"{output_path.stem}_nav.svg")
+    combined_first_trade = min(first_trade_dates) if first_trade_dates else valuation_date
+    benchmark_curve = build_benchmark_curve(
+        price_history[BENCHMARK_SYMBOL],
+        combined_first_trade,
+        valuation_date,
+    )
+    chart_curves = {
+        "Combined": combined_daily_performance.history,
+        f"{BENCHMARK_SYMBOL} (price)": benchmark_curve,
+    }
+    excess_return_curve = build_excess_return_curve(
+        combined_daily_performance.history,
+        benchmark_curve,
+    )
+    write_nav_chart(
+        nav_chart_path,
+        chart_curves,
+        excess_return_curve,
+    )
+    write_report(
+        output_path,
+        workbook_path,
+        reports,
+        combined,
+        run_datetime,
+        quotes,
+        nav_chart_path,
+        args.risk_free_rate,
+    )
 
     print(f"Wrote report to {output_path}")
     print(f"Accounts: {', '.join(report.account for report in reports)}")
@@ -1418,6 +2046,10 @@ def main() -> int:
         f"Relative XIRR to {BENCHMARK_SYMBOL}: "
         f"{pct(combined['relative_money_weighted_return_pct'])}"
     )
+    print(f"Combined TWR: {pct(combined['time_weighted_return_pct'])}")
+    print(f"Maximum drawdown: {pct(combined['max_drawdown_pct'])}")
+    print(f"Sharpe ratio: {ratio(combined['sharpe_ratio'])}")
+    print(f"TWR chart: {nav_chart_path}")
     return 0
 
 

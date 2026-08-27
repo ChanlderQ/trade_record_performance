@@ -19,6 +19,10 @@ It calculates separate account reports and a combined report, including:
 - return relative to VOO, calculated as account return minus VOO return
 - money-weighted account return (XIRR) when CASH flows are present
 - cash-flow-matched VOO ending value, P&L, return, XIRR, and relative XIRR
+- daily time-weighted return (TWR)
+- maximum drawdown and annualized Sharpe ratio
+- an SVG TWR net-value curve for the combined account and VOO, plus a
+  cumulative excess-return line on the right percentage axis
 - net cash flow and cash balance when `CASH` rows are present
 - per-account open positions
 - combined open positions
@@ -71,6 +75,7 @@ By default, the report is written using the valuation date:
 
 ```text
 account_report_YYYY-MM-DD.md
+account_report_YYYY-MM-DD_nav.svg
 ```
 
 For an `--as-of` report, `YYYY-MM-DD` is the closest trading day on or before
@@ -82,6 +87,13 @@ You can override the output path:
 python3 generate_account_report.py \
   --input "/path/to/James trade record.xlsx" \
   --output my_report.md
+```
+
+The Sharpe ratio assumes a 0% annual risk-free rate by default. Set a different
+annual rate as a decimal when needed:
+
+```bash
+python3 generate_account_report.py --risk-free-rate 0.04
 ```
 
 ## Daily GitHub Actions Run
@@ -163,3 +175,11 @@ Only `UOB` and `IB` are read. Other worksheets are ignored.
 - XIRR is shown only when the dated investor cash flows contain at least one
   contribution and one positive terminal value or withdrawal. Relative XIRR is
   the account XIRR minus the cash-flow-matched VOO XIRR.
+- TWR is calculated from daily closing values after removing external CASH
+  flows. CASH flows are assumed to occur before that day's return period. A
+  positive initial CASH contribution is required and forms the first day's
+  return base; the normalized curve uses an initial capital base of 100.
+- Maximum drawdown is the largest peak-to-trough decline in the TWR net-value
+  series. Sharpe ratio uses daily TWR returns and 252 trading days per year.
+- The excess-return curve equals combined-account cumulative TWR minus
+  cumulative VOO price return and uses the chart's right percentage axis.
