@@ -92,5 +92,5 @@ jobs:
           name: account-report-${{ github.run_id }}
           path: |
             reports/account_report_*.md
-            reports/account_report_*_nav.svg
+            reports/account_report_*_nav.png
           if-no-files-found: error

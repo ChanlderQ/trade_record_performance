@@ -21,7 +21,7 @@ It calculates separate account reports and a combined report, including:
 - cash-flow-matched VOO ending value, P&L, return, XIRR, and relative XIRR
 - daily time-weighted return (TWR)
 - maximum drawdown and annualized Sharpe ratio
-- an SVG TWR net-value curve for the combined account and VOO, plus a
+- a PNG TWR net-value curve for the combined account and VOO, plus a
   cumulative excess-return line on the right percentage axis
 - net cash flow and cash balance when `CASH` rows are present
 - per-account open positions
@@ -75,7 +75,7 @@ By default, the report is written using the valuation date:
 
 ```text
 account_report_YYYY-MM-DD.md
-account_report_YYYY-MM-DD_nav.svg
+account_report_YYYY-MM-DD_nav.png
 ```
 
 For an `--as-of` report, `YYYY-MM-DD` is the closest trading day on or before

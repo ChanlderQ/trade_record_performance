@@ -12,7 +12,6 @@ no API key or a quote request fails, Yahoo Finance is used as a fallback.
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import math
 import os
@@ -1142,129 +1141,63 @@ def write_nav_chart(
         else pd.DataFrame()
     )
 
-    width, height = 1000, 540
-    left, right, top, bottom = 82, 110, 64, 70
-    plot_width = width - left - right
-    plot_height = height - top - bottom
-    all_dates = [curve.index.min() for curve in usable_curves.values()] + [
-        curve.index.max() for curve in usable_curves.values()
-    ]
-    min_date, max_date = min(all_dates), max(all_dates)
-    date_span = max((max_date - min_date).days, 1)
-    all_values = [
-        float(value)
-        for curve in usable_curves.values()
-        for value in curve["TWR Index"].tolist()
-    ]
-    min_value, max_value = min(all_values), max(all_values)
-    value_span = max(max_value - min_value, 1.0)
-    padding = value_span * 0.08
-    y_min = min_value - padding
-    y_max = max_value + padding
+    # Matplotlib needs a writable cache in sandboxed and CI environments.
+    chart_cache = Path(os.environ.get("TMPDIR", "/tmp")) / "performance-chart-cache"
+    chart_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(chart_cache / "matplotlib"))
+    os.environ.setdefault("XDG_CACHE_HOME", str(chart_cache))
 
-    def x_position(value_date: date) -> float:
-        return left + (value_date - min_date).days / date_span * plot_width
+    import matplotlib
 
-    def y_position(value: float) -> float:
-        return top + (y_max - value) / (y_max - y_min) * plot_height
+    matplotlib.use("Agg")
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mtick
 
-    excess_y_min = excess_y_max = None
-    if not usable_excess.empty:
-        excess_min = float(usable_excess["Excess Return"].min())
-        excess_max = float(usable_excess["Excess Return"].max())
-        excess_span = max(excess_max - excess_min, 0.01)
-        excess_padding = excess_span * 0.08
-        excess_y_min = excess_min - excess_padding
-        excess_y_max = excess_max + excess_padding
-
-    def excess_y_position(value: float) -> float:
-        if excess_y_min is None or excess_y_max is None:
-            raise ValueError("Excess-return axis is not available")
-        return top + (excess_y_max - value) / (excess_y_max - excess_y_min) * plot_height
-
-    colors = ["#2563eb", "#16a34a", "#f97316", "#7c3aed", "#dc2626"]
-    svg = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-        '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="82" y="34" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#111827">TWR Net Value and Excess Return</text>',
-        f'<text x="{left}" y="52" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Net value (left axis, initial capital = 100)</text>',
-    ]
-
-    for tick in range(6):
-        tick_value = y_min + (y_max - y_min) * tick / 5
-        y = y_position(tick_value)
-        svg.append(
-            f'<line x1="{left}" y1="{y:.2f}" x2="{width-right}" y2="{y:.2f}" stroke="#e5e7eb" stroke-width="1"/>'
-        )
-        svg.append(
-            f'<text x="{left-10}" y="{y+4:.2f}" text-anchor="end" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">{tick_value:.1f}</text>'
-        )
-
-    for tick in range(5):
-        tick_date = min_date + timedelta(days=round(date_span * tick / 4))
-        x = x_position(tick_date)
-        anchor = "start" if tick == 0 else "end" if tick == 4 else "middle"
-        svg.append(
-            f'<line x1="{x:.2f}" y1="{top}" x2="{x:.2f}" y2="{height-bottom}" stroke="#f3f4f6" stroke-width="1"/>'
-        )
-        svg.append(
-            f'<text x="{x:.2f}" y="{height-bottom+24}" text-anchor="{anchor}" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">{tick_date.isoformat()}</text>'
-        )
-
-    if excess_y_min is not None and excess_y_max is not None:
-        svg.append(
-            f'<text x="{width-right}" y="52" text-anchor="end" font-family="Arial, sans-serif" font-size="12" fill="#dc2626">Cumulative excess return (right axis)</text>'
-        )
-        for tick in range(6):
-            tick_value = excess_y_min + (excess_y_max - excess_y_min) * tick / 5
-            y = excess_y_position(tick_value)
-            svg.append(
-                f'<line x1="{width-right}" y1="{y:.2f}" x2="{width-right+5}" y2="{y:.2f}" stroke="#dc2626" stroke-width="1"/>'
-            )
-            svg.append(
-                f'<text x="{width-right+10}" y="{y+4:.2f}" text-anchor="start" font-family="Arial, sans-serif" font-size="12" fill="#dc2626">{tick_value:.1%}</text>'
-            )
-        if excess_y_min <= 0 <= excess_y_max:
-            zero_y = excess_y_position(0)
-            svg.append(
-                f'<line x1="{left}" y1="{zero_y:.2f}" x2="{width-right}" y2="{zero_y:.2f}" stroke="#fecaca" stroke-width="1" stroke-dasharray="4 4"/>'
-            )
+    figure, left_axis = plt.subplots(figsize=(12, 6.4), dpi=150)
+    colors = ["#2563eb", "#16a34a", "#f97316", "#7c3aed"]
 
     for index, (name, curve) in enumerate(usable_curves.items()):
-        color = colors[index % len(colors)]
-        points = " ".join(
-            f"{x_position(curve_date):.2f},{y_position(float(value)):.2f}"
-            for curve_date, value in curve["TWR Index"].items()
-        )
-        svg.append(
-            f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>'
-        )
-        legend_x = left + index * 170
-        svg.append(
-            f'<line x1="{legend_x}" y1="{height-18}" x2="{legend_x+26}" y2="{height-18}" stroke="{color}" stroke-width="3"/>'
-        )
-        svg.append(
-            f'<text x="{legend_x+34}" y="{height-14}" font-family="Arial, sans-serif" font-size="13" fill="#374151">{html.escape(name)}</text>'
+        left_axis.plot(
+            pd.to_datetime(curve.index),
+            curve["TWR Index"],
+            color=colors[index % len(colors)],
+            linewidth=2.2,
+            label=name,
         )
 
+    left_axis.set_title("TWR Net Value and Excess Return", loc="left", fontsize=16, weight="bold")
+    left_axis.set_ylabel("Net value (initial capital = 100)")
+    left_axis.grid(axis="both", color="#e5e7eb", linewidth=0.8)
+    left_axis.set_axisbelow(True)
+    date_locator = mdates.AutoDateLocator(minticks=4, maxticks=7)
+    left_axis.xaxis.set_major_locator(date_locator)
+    left_axis.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
+
+    handles, labels = left_axis.get_legend_handles_labels()
     if not usable_excess.empty:
-        excess_points = " ".join(
-            f"{x_position(curve_date):.2f},{excess_y_position(float(value)):.2f}"
-            for curve_date, value in usable_excess["Excess Return"].items()
+        right_axis = left_axis.twinx()
+        right_axis.plot(
+            pd.to_datetime(usable_excess.index),
+            usable_excess["Excess Return"],
+            color="#dc2626",
+            linewidth=2.2,
+            linestyle="--",
+            label="Excess return",
         )
-        svg.append(
-            f'<polyline points="{excess_points}" fill="none" stroke="#dc2626" stroke-width="2.5" stroke-dasharray="7 5" stroke-linejoin="round" stroke-linecap="round"/>'
-        )
-        legend_x = left + len(usable_curves) * 170
-        svg.append(
-            f'<line x1="{legend_x}" y1="{height-18}" x2="{legend_x+26}" y2="{height-18}" stroke="#dc2626" stroke-width="3" stroke-dasharray="7 5"/>'
-        )
-        svg.append(
-            f'<text x="{legend_x+34}" y="{height-14}" font-family="Arial, sans-serif" font-size="13" fill="#374151">Excess return</text>'
-        )
+        right_axis.axhline(0, color="#fecaca", linewidth=1, linestyle="--")
+        right_axis.set_ylabel("Cumulative excess return", color="#dc2626")
+        right_axis.tick_params(axis="y", colors="#dc2626")
+        right_axis.spines["right"].set_color("#dc2626")
+        right_axis.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+        right_handles, right_labels = right_axis.get_legend_handles_labels()
+        handles += right_handles
+        labels += right_labels
 
-    svg.append("</svg>")
-    output_path.write_text("\n".join(svg))
+    left_axis.legend(handles, labels, loc="upper left", ncol=len(labels), frameon=False)
+    figure.tight_layout()
+    figure.savefig(output_path, format="png", dpi=150, facecolor="white", bbox_inches="tight")
+    plt.close(figure)
 
 
 def process_trades_until(
@@ -2000,7 +1933,7 @@ def main() -> int:
         benchmark_historical_quotes,
         combined_daily_performance,
     )
-    nav_chart_path = output_path.with_name(f"{output_path.stem}_nav.svg")
+    nav_chart_path = output_path.with_name(f"{output_path.stem}_nav.png")
     combined_first_trade = min(first_trade_dates) if first_trade_dates else valuation_date
     benchmark_curve = build_benchmark_curve(
         price_history[BENCHMARK_SYMBOL],

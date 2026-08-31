@@ -6,7 +6,7 @@
 
 # Generated reports
 account_report*.md
-account_report*_nav.svg
+account_report*_nav.png
 
 # Price caches
 .fmp_cache/

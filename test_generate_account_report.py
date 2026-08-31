@@ -161,13 +161,13 @@ class TimeWeightedReturnTests(unittest.TestCase):
         self.assertAlmostEqual(result.max_drawdown_pct, -0.10)
         self.assertIsNotNone(result.sharpe_ratio)
 
-    def test_writes_svg_nav_chart(self):
+    def test_writes_png_nav_chart(self):
         curve = pd.DataFrame(
             {"TWR Index": [100.0, 105.0]},
             index=[date(2025, 1, 2), date(2025, 1, 3)],
         )
         with TemporaryDirectory() as temp_dir:
-            output = Path(temp_dir) / "nav.svg"
+            output = Path(temp_dir) / "nav.png"
             excess = pd.DataFrame(
                 {"Excess Return": [0.0, 0.05]},
                 index=curve.index,
@@ -178,12 +178,7 @@ class TimeWeightedReturnTests(unittest.TestCase):
                 excess,
             )
 
-            svg = output.read_text()
-            self.assertIn("<svg", svg)
-            self.assertIn("Combined", svg)
-            self.assertIn("VOO", svg)
-            self.assertIn("Cumulative excess return (right axis)", svg)
-            self.assertIn("Excess return", svg)
+            self.assertTrue(output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_excess_curve_is_twr_minus_benchmark_return(self):
         dates = [date(2025, 1, 2), date(2025, 1, 3), date(2025, 1, 6)]
