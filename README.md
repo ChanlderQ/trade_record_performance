@@ -28,7 +28,8 @@ It calculates separate account reports and a combined report, including:
 - combined open positions
 
 Latest prices are fetched from Financial Modeling Prep first. If FMP has no API
-key or a quote request fails, the script falls back to Yahoo Finance.
+key or a request fails, the script tries Tiingo, then Yahoo Finance. Tiingo uses
+the latest available daily close, not an intraday quote.
 
 By default, quote prices are refreshed on every run. Cached prices are not used
 unless `--allow-cache-fallback` is passed explicitly.
@@ -41,14 +42,18 @@ Create a local `.env` file from the example:
 cp .env.example .env
 ```
 
-Then add your FMP key:
+Then add your API keys (either key is optional):
 
 ```env
 FMP_API_KEY=your_fmp_key_here
+TIINGO_API_KEY=your_tiingo_key_here
 ```
 
-The key is optional because Yahoo Finance is used as a fallback, but FMP is tried
-first when a key is available.
+Keys can also be set as environment variables or passed with `--api-key` (FMP)
+and `--tiingo-api-key` (Tiingo). Priority is command line, environment, then `.env`.
+The provider order is FMP → Tiingo → Yahoo Finance. Tiingo uses raw `close` prices
+for consistency with the existing price-return calculations. See the
+[Tiingo EOD documentation](https://www.tiingo.com/documentation/end-of-day).
 
 ## Usage
 
@@ -113,7 +118,8 @@ Configure these repository secrets in GitHub:
 | Secret | Required | Purpose |
 | --- | --- | --- |
 | `TRADE_RECORD_URL` | Yes | Private download URL for the Excel workbook |
-| `FMP_API_KEY` | No | FMP API key; Yahoo Finance is used as fallback |
+| `FMP_API_KEY` | No | FMP API key |
+| `TIINGO_API_KEY` | No | Tiingo API key; used after FMP and before Yahoo Finance |
 
 For a Google Sheet, `TRADE_RECORD_URL` can be the normal sheet URL:
 

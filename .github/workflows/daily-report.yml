@@ -79,6 +79,7 @@ jobs:
         if: steps.schedule-check.outputs.should_run == 'true'
         env:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
         run: |
           mkdir -p reports
           python generate_account_report.py \

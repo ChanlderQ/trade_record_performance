@@ -6,7 +6,7 @@ The workbook is expected to contain two sheets:
   - IB
 
 Latest prices are downloaded from Financial Modeling Prep (FMP) first. If FMP has
-no API key or a quote request fails, Yahoo Finance is used as a fallback.
+no API key or a request fails, Tiingo EOD then Yahoo Finance are tried.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote as urlquote, urlencode
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -44,6 +44,7 @@ BENCHMARK_SYMBOL = "VOO"
 TRADING_DAYS_PER_YEAR = 252
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
+TIINGO_PRICE_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
@@ -148,6 +149,11 @@ def parse_args() -> argparse.Namespace:
         help="FMP API key. Defaults to FMP_API_KEY from environment or .env.",
     )
     parser.add_argument(
+        "--tiingo-api-key",
+        default=None,
+        help="Tiingo API key. Defaults to TIINGO_API_KEY from environment or .env.",
+    )
+    parser.add_argument(
         "--cache-dir",
         default=".price_cache",
         help="Directory for cached latest-price responses.",
@@ -160,7 +166,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--allow-cache-fallback",
         action="store_true",
-        help="Use cached prices only if both FMP and Yahoo live quote requests fail.",
+        help="Use cached prices only if all FMP, Tiingo and Yahoo requests fail.",
     )
     parser.add_argument(
         "--risk-free-rate",
@@ -191,12 +197,14 @@ def load_dotenv(path: Path) -> dict[str, str]:
     return values
 
 
-def get_api_key(cli_api_key: str | None, dotenv_path: Path) -> str | None:
+def get_api_key(
+    cli_api_key: str | None, dotenv_path: Path, env_name: str = "FMP_API_KEY"
+) -> str | None:
     if cli_api_key:
         return cli_api_key
-    if os.environ.get("FMP_API_KEY"):
-        return os.environ["FMP_API_KEY"]
-    return load_dotenv(dotenv_path).get("FMP_API_KEY")
+    if os.environ.get(env_name):
+        return os.environ[env_name]
+    return load_dotenv(dotenv_path).get(env_name)
 
 
 def money(value: float | None) -> str:
@@ -256,6 +264,74 @@ def read_json_url(url: str) -> Any:
     )
     with urlopen(request, timeout=30, context=ssl_context()) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_tiingo_prices(
+    symbol: str,
+    api_key: str | None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+) -> dict[date, float]:
+    """Fetch raw EOD closes, matching the other providers' price-return basis."""
+    if not api_key:
+        raise RuntimeError("Tiingo API key is not set")
+    query = {"token": api_key, "format": "json"}
+    if start_date is not None:
+        query["startDate"] = start_date.isoformat()
+    if end_date is not None:
+        query["endDate"] = end_date.isoformat()
+    ticker = urlquote(symbol.lower().replace(".", "-"), safe="")
+    url = TIINGO_PRICE_URL.format(symbol=ticker) + "?" + urlencode(query)
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(f"Tiingo HTTP error for {symbol}: {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Tiingo network error for {symbol}") from exc
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"Tiingo returned invalid JSON for {symbol}") from exc
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"Tiingo returned no prices for {symbol}")
+    prices = {}
+    try:
+        for item in payload:
+            if item.get("date") and item.get("close") is not None:
+                price_date = pd.to_datetime(item["date"]).date()
+                price = float(item["close"])
+                if math.isfinite(price) and price > 0:
+                    if (start_date is None or price_date >= start_date) and (
+                        end_date is None or price_date <= end_date
+                    ):
+                        prices[price_date] = price
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise RuntimeError(f"Tiingo returned invalid prices for {symbol}") from exc
+    if not prices:
+        raise RuntimeError(f"Tiingo returned no valid closing prices for {symbol}")
+    return prices
+
+
+def fetch_tiingo_quote(symbol: str, api_key: str | None) -> PriceQuote:
+    prices = fetch_tiingo_prices(symbol, api_key)
+    price_date = max(prices)
+    return PriceQuote(
+        symbol=symbol, price=prices[price_date], source="Tiingo EOD",
+        price_time=price_date.isoformat(),
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def fetch_tiingo_historical_quote(
+    symbol: str, target_date: date, api_key: str | None,
+) -> PriceQuote:
+    prices = fetch_tiingo_prices(
+        symbol, api_key, target_date - timedelta(days=10), target_date,
+    )
+    price_date, price = latest_price_on_or_before(list(prices.items()), target_date)
+    return PriceQuote(
+        symbol=symbol, price=price, source="Tiingo historical",
+        price_time=price_date.isoformat(),
+        fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
 
 def fetch_fmp_quote(symbol: str, api_key: str | None) -> PriceQuote:
@@ -544,6 +620,7 @@ def fetch_historical_series(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> dict[date, float]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / (
@@ -556,7 +633,11 @@ def fetch_historical_series(
     except RuntimeError as exc:
         errors.append(str(exc))
         try:
-            prices = fetch_yahoo_historical_series(symbol, start_date, end_date)
+            try:
+                prices = fetch_tiingo_prices(symbol, tiingo_api_key, start_date, end_date)
+            except RuntimeError as tiingo_exc:
+                errors.append(str(tiingo_exc))
+                prices = fetch_yahoo_historical_series(symbol, start_date, end_date)
         except RuntimeError as yahoo_exc:
             errors.append(str(yahoo_exc))
             if cache_file.exists() and allow_cache_fallback:
@@ -592,6 +673,7 @@ def fetch_latest_quote(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> PriceQuote:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_latest.json"
@@ -602,7 +684,11 @@ def fetch_latest_quote(
     except RuntimeError as exc:
         errors.append(str(exc))
         try:
-            quote = fetch_yahoo_quote(symbol)
+            try:
+                quote = fetch_tiingo_quote(symbol, tiingo_api_key)
+            except RuntimeError as tiingo_exc:
+                errors.append(str(tiingo_exc))
+                quote = fetch_yahoo_quote(symbol)
         except RuntimeError as yahoo_exc:
             errors.append(str(yahoo_exc))
             if cache_file.exists() and allow_cache_fallback:
@@ -621,6 +707,7 @@ def fetch_historical_quote(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> PriceQuote:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_{target_date.isoformat()}_historical.json"
@@ -631,7 +718,11 @@ def fetch_historical_quote(
     except RuntimeError as exc:
         errors.append(str(exc))
         try:
-            quote = fetch_yahoo_historical_quote(symbol, target_date)
+            try:
+                quote = fetch_tiingo_historical_quote(symbol, target_date, tiingo_api_key)
+            except RuntimeError as tiingo_exc:
+                errors.append(str(tiingo_exc))
+                quote = fetch_yahoo_historical_quote(symbol, target_date)
         except RuntimeError as yahoo_exc:
             errors.append(str(yahoo_exc))
             if cache_file.exists() and allow_cache_fallback:
@@ -651,9 +742,10 @@ def load_latest_prices(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> dict[str, PriceQuote]:
     return {
-        symbol: fetch_latest_quote(symbol, api_key, cache_dir, allow_cache_fallback)
+        symbol: fetch_latest_quote(symbol, api_key, cache_dir, allow_cache_fallback, tiingo_api_key)
         for symbol in symbols
     }
 
@@ -664,6 +756,7 @@ def load_historical_prices(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> dict[str, PriceQuote]:
     return {
         symbol: fetch_historical_quote(
@@ -672,6 +765,7 @@ def load_historical_prices(
             api_key,
             cache_dir,
             allow_cache_fallback,
+            tiingo_api_key,
         )
         for symbol in symbols
     }
@@ -684,6 +778,7 @@ def load_historical_series(
     api_key: str | None,
     cache_dir: Path,
     allow_cache_fallback: bool,
+    tiingo_api_key: str | None = None,
 ) -> dict[str, dict[date, float]]:
     return {
         symbol: fetch_historical_series(
@@ -693,6 +788,7 @@ def load_historical_series(
             api_key,
             cache_dir,
             allow_cache_fallback,
+            tiingo_api_key,
         )
         for symbol in symbols
     }
@@ -1766,6 +1862,7 @@ def main() -> int:
     run_datetime = datetime.now()
     dotenv_path = Path(".env")
     api_key = get_api_key(args.api_key, dotenv_path)
+    tiingo_api_key = get_api_key(args.tiingo_api_key, dotenv_path, "TIINGO_API_KEY")
 
     workbook_path = Path(args.input).expanduser().resolve()
     requested_as_of = (
@@ -1788,6 +1885,7 @@ def main() -> int:
         quotes = load_latest_prices(
             symbols=quote_symbols,
             api_key=api_key,
+            tiingo_api_key=tiingo_api_key,
             cache_dir=Path(args.cache_dir),
             allow_cache_fallback=args.allow_cache_fallback,
         )
@@ -1797,6 +1895,7 @@ def main() -> int:
             symbols=quote_symbols,
             target_date=requested_as_of,
             api_key=api_key,
+            tiingo_api_key=tiingo_api_key,
             cache_dir=Path(args.cache_dir),
             allow_cache_fallback=args.allow_cache_fallback,
         )
@@ -1813,6 +1912,7 @@ def main() -> int:
                 symbols=quote_symbols,
                 target_date=valuation_date,
                 api_key=api_key,
+                tiingo_api_key=tiingo_api_key,
                 cache_dir=Path(args.cache_dir),
                 allow_cache_fallback=args.allow_cache_fallback,
             )
@@ -1832,6 +1932,7 @@ def main() -> int:
         symbols=ytd_start_symbols,
         target_date=ytd_start_date,
         api_key=api_key,
+        tiingo_api_key=tiingo_api_key,
         cache_dir=Path(args.cache_dir),
         allow_cache_fallback=args.allow_cache_fallback,
     )
@@ -1859,6 +1960,7 @@ def main() -> int:
                 api_key,
                 Path(args.cache_dir),
                 args.allow_cache_fallback,
+                tiingo_api_key,
             )
         )
         for quote_date in benchmark_quote_dates
@@ -1880,6 +1982,7 @@ def main() -> int:
         start_date=history_start_date,
         end_date=valuation_date,
         api_key=api_key,
+        tiingo_api_key=tiingo_api_key,
         cache_dir=Path(args.cache_dir),
         allow_cache_fallback=args.allow_cache_fallback,
     )
