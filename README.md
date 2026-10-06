@@ -27,9 +27,18 @@ It calculates separate account reports and a combined report, including:
 - per-account open positions
 - combined open positions
 
-Latest prices are fetched from Financial Modeling Prep first. If FMP has no API
-key or a request fails, the script tries Tiingo, then Yahoo Finance. Tiingo uses
-the latest available daily close, not an intraday quote.
+Daily EOD prices form the history. For a latest report, the script compares each
+symbol's last daily price date with today's date in America/New_York. If today's
+daily price is missing, it requests Tiingo's equity realtime `tngoLast` reference
+price and appends it at the quote's actual market date when newer than the EOD
+history. Existing daily closes are preserved. Weekend or stale snapshots do not
+create artificial daily rows. This also updates today's TWR curve endpoint.
+
+If Tiingo realtime fails, FMP and Yahoo are tried. If all fail, an available EOD
+price is retained with a warning. Mixed latest quote dates stop the report to
+avoid combining different valuation days. The report and console show sources
+and timestamps. Realtime reference prices may include after-hours trading and
+are not official daily closes. Explicit `--as-of` reports use daily prices only.
 
 By default, quote prices are refreshed on every run. Cached prices are not used
 unless `--allow-cache-fallback` is passed explicitly.
@@ -51,9 +60,11 @@ TIINGO_API_KEY=your_tiingo_key_here
 
 Keys can also be set as environment variables or passed with `--api-key` (FMP)
 and `--tiingo-api-key` (Tiingo). Priority is command line, environment, then `.env`.
-The provider order is FMP → Tiingo → Yahoo Finance. Tiingo uses raw `close` prices
+Historical daily prices use FMP → Tiingo → Yahoo Finance. Missing current-day
+prices use Tiingo realtime → FMP quote → Yahoo quote. Tiingo EOD uses raw `close` prices
 for consistency with the existing price-return calculations. See the
-[Tiingo EOD documentation](https://www.tiingo.com/documentation/end-of-day).
+[Tiingo EOD documentation](https://www.tiingo.com/documentation/end-of-day) and
+[equity realtime documentation](https://www.tiingo.com/documentation/equity-realtime-stock-data).
 
 ## Usage
 
@@ -119,7 +130,7 @@ Configure these repository secrets in GitHub:
 | --- | --- | --- |
 | `TRADE_RECORD_URL` | Yes | Private download URL for the Excel workbook |
 | `FMP_API_KEY` | No | FMP API key |
-| `TIINGO_API_KEY` | No | Tiingo API key; used after FMP and before Yahoo Finance |
+| `TIINGO_API_KEY` | No | Tiingo daily history and realtime supplementation for missing current-day prices |
 
 For a Google Sheet, `TRADE_RECORD_URL` can be the normal sheet URL:
 

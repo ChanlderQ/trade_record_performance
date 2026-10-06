@@ -5,8 +5,8 @@ The workbook is expected to contain two sheets:
   - UOB
   - IB
 
-Latest prices are downloaded from Financial Modeling Prep (FMP) first. If FMP has
-no API key or a request fails, Tiingo EOD then Yahoo Finance are tried.
+Daily prices form the report history. Missing current-day prices are supplemented
+with Tiingo realtime reference prices; FMP and Yahoo are fallback quote sources.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 import math
 import os
 import ssl
+import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -24,6 +25,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote as urlquote, urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -45,6 +47,8 @@ TRADING_DAYS_PER_YEAR = 252
 FMP_QUOTE_URL = "https://financialmodelingprep.com/stable/quote"
 FMP_HISTORY_URL = "https://financialmodelingprep.com/stable/historical-price-eod/full"
 TIINGO_PRICE_URL = "https://api.tiingo.com/tiingo/daily/{symbol}/prices"
+TIINGO_REALTIME_URL = "https://api.tiingo.com/tiingo/equity/intraday/{symbol}"
+MARKET_TIMEZONE = ZoneInfo("America/New_York")
 YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
@@ -317,6 +321,46 @@ def fetch_tiingo_quote(symbol: str, api_key: str | None) -> PriceQuote:
         symbol=symbol, price=prices[price_date], source="Tiingo EOD",
         price_time=price_date.isoformat(),
         fetched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
+def market_today() -> date:
+    return datetime.now(MARKET_TIMEZONE).date()
+
+
+def quote_date(quote: PriceQuote) -> date | None:
+    if not quote.price_time:
+        return None
+    timestamp = pd.Timestamp(quote.price_time)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert(MARKET_TIMEZONE)
+    return timestamp.date()
+
+
+def fetch_tiingo_realtime_quote(symbol: str, api_key: str | None) -> PriceQuote:
+    if not api_key:
+        raise RuntimeError("Tiingo API key is not set")
+    ticker = urlquote(symbol.lower().replace(".", "-"), safe="")
+    url = TIINGO_REALTIME_URL.format(symbol=ticker) + "?" + urlencode({"token": api_key})
+    try:
+        payload = read_json_url(url)
+    except HTTPError as exc:
+        raise RuntimeError(f"Tiingo realtime HTTP error for {symbol}: {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Tiingo realtime network error for {symbol}") from exc
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(f"Tiingo returned invalid realtime JSON for {symbol}") from exc
+    try:
+        item = next(row for row in payload if row.get("ticker", "").lower() == ticker)
+        price = float(item["tngoLast"])
+        timestamp = pd.Timestamp(item["timestamp"])
+        if not math.isfinite(price) or price <= 0 or pd.isna(timestamp) or timestamp.tzinfo is None:
+            raise ValueError("Invalid price or timestamp")
+    except (StopIteration, AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Tiingo returned no valid realtime quote for {symbol}") from exc
+    return PriceQuote(
+        symbol, price, "Tiingo realtime reference", timestamp.tz_convert(MARKET_TIMEZONE).isoformat(),
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
 
@@ -674,28 +718,50 @@ def fetch_latest_quote(
     cache_dir: Path,
     allow_cache_fallback: bool,
     tiingo_api_key: str | None = None,
+    daily_prices: dict[date, float] | None = None,
 ) -> PriceQuote:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{symbol}_latest.json"
 
+    today = market_today()
     errors = []
+    quote = None
     try:
-        quote = fetch_fmp_quote(symbol, api_key)
+        if daily_prices:
+            dated_price = latest_price_on_or_before(list(daily_prices.items()), today)
+            if dated_price is None:
+                raise RuntimeError(f"No daily price on or before {today} for {symbol}")
+            price_date, price = dated_price
+            quote = PriceQuote(symbol, price, "EOD history", price_date.isoformat())
+        else:
+            quote = fetch_tiingo_quote(symbol, tiingo_api_key)
     except RuntimeError as exc:
         errors.append(str(exc))
-        try:
+    if quote is None or quote_date(quote) < today:
+        for fetcher in (
+            lambda: fetch_tiingo_realtime_quote(symbol, tiingo_api_key),
+            lambda: fetch_fmp_quote(symbol, api_key),
+            lambda: fetch_yahoo_quote(symbol),
+        ):
             try:
-                quote = fetch_tiingo_quote(symbol, tiingo_api_key)
-            except RuntimeError as tiingo_exc:
-                errors.append(str(tiingo_exc))
-                quote = fetch_yahoo_quote(symbol)
-        except RuntimeError as yahoo_exc:
-            errors.append(str(yahoo_exc))
+                candidate = fetcher()
+                candidate_date = quote_date(candidate)
+                if candidate_date is None or candidate_date > today:
+                    raise RuntimeError(f"Invalid latest quote date for {symbol}")
+                if quote is None or candidate_date > quote_date(quote):
+                    quote = candidate
+                # A valid but older snapshot must not manufacture a trading day.
+                break
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        if errors and quote is not None and quote_date(quote) < today:
+            warnings.warn(f"{symbol}: retaining {quote.price_time} price; " + "; ".join(errors))
+        if quote is None:
             if cache_file.exists() and allow_cache_fallback:
                 cached = PriceQuote(**json.loads(cache_file.read_text()))
                 cached.source = f"cached {cached.source}"
                 return cached
-            raise RuntimeError(f"Could not fetch latest price for {symbol}: {'; '.join(errors)}") from yahoo_exc
+            raise RuntimeError(f"Could not fetch latest price for {symbol}: {'; '.join(errors)}")
 
     cache_file.write_text(json.dumps(quote.__dict__, indent=2, sort_keys=True))
     return quote
@@ -743,9 +809,13 @@ def load_latest_prices(
     cache_dir: Path,
     allow_cache_fallback: bool,
     tiingo_api_key: str | None = None,
+    price_history: dict[str, dict[date, float]] | None = None,
 ) -> dict[str, PriceQuote]:
     return {
-        symbol: fetch_latest_quote(symbol, api_key, cache_dir, allow_cache_fallback, tiingo_api_key)
+        symbol: fetch_latest_quote(
+            symbol, api_key, cache_dir, allow_cache_fallback, tiingo_api_key,
+            price_history.get(symbol) if price_history is not None else None,
+        )
         for symbol in symbols
     }
 
@@ -769,6 +839,17 @@ def load_historical_prices(
         )
         for symbol in symbols
     }
+
+
+def supplement_price_history(
+    price_history: dict[str, dict[date, float]], quotes: dict[str, PriceQuote],
+) -> None:
+    """Append missing valuation points at their true dates, preserving EOD closes."""
+    for symbol, quote in quotes.items():
+        price_date = quote_date(quote)
+        if price_date is None:
+            raise RuntimeError(f"Missing quote date for {symbol}")
+        price_history.setdefault(symbol, {}).setdefault(price_date, quote.price)
 
 
 def load_historical_series(
@@ -1709,7 +1790,7 @@ def valuation_date_from_quotes(
         if not quote.price_time:
             continue
         try:
-            quote_dates.append(pd.to_datetime(quote.price_time).date())
+            quote_dates.append(quote_date(quote))
         except (TypeError, ValueError):
             continue
     if not quote_dates:
@@ -1799,6 +1880,18 @@ def write_report(
             ]
         )
 
+    lines.extend([
+        "## Valuation Price Sources",
+        "",
+        "Daily closes form the history. Missing current-day data is supplemented with realtime reference prices (including after-hours), not official closes. Check each price date below for delayed data.",
+        "",
+        markdown_table(pd.DataFrame([
+            {"Symbol": symbol, "Price": quote.price, "Source": quote.source,
+             "Price time": quote.price_time or "unknown"}
+            for symbol, quote in sorted(quotes.items())
+        ])),
+        "",
+    ])
     output_path.write_text("\n".join(lines))
 
 
@@ -1873,7 +1966,7 @@ def main() -> int:
 
     trades_by_account = read_trades(workbook_path)
     all_trades = pd.concat(trades_by_account.values(), ignore_index=True)
-    initial_cutoff_date = requested_as_of or date.today()
+    initial_cutoff_date = requested_as_of or market_today()
     _, _, combined_open_qty, _ = calculate_fifo(all_trades, initial_cutoff_date)
     symbols = sorted(
         symbol for symbol, qty in combined_open_qty.items()
@@ -1881,15 +1974,44 @@ def main() -> int:
     )
     quote_symbols = sorted(set(symbols) | {BENCHMARK_SYMBOL})
 
+    history_trades = all_trades[all_trades["Date"] <= initial_cutoff_date]
+    history_start_date = history_trades["Date"].min() - timedelta(days=10)
+    history_symbols = sorted(
+        set(
+            history_trades.loc[
+                ~history_trades["Symbol"].map(is_cash_symbol),
+                "Symbol",
+            ]
+        )
+        | {BENCHMARK_SYMBOL}
+    )
+    price_history = load_historical_series(
+        symbols=history_symbols,
+        start_date=history_start_date,
+        end_date=initial_cutoff_date,
+        api_key=api_key,
+        tiingo_api_key=tiingo_api_key,
+        cache_dir=Path(args.cache_dir),
+        allow_cache_fallback=args.allow_cache_fallback,
+    )
+
     if requested_as_of is None:
         quotes = load_latest_prices(
             symbols=quote_symbols,
+            price_history=price_history,
             api_key=api_key,
             tiingo_api_key=tiingo_api_key,
             cache_dir=Path(args.cache_dir),
             allow_cache_fallback=args.allow_cache_fallback,
         )
-        valuation_date = valuation_date_from_quotes(quotes, date.today())
+        valuation_date = valuation_date_from_quotes(quotes, initial_cutoff_date)
+        dated_quotes = {quote_date(quote) for quote in quotes.values()}
+        if len(dated_quotes) != 1 or None in dated_quotes:
+            raise RuntimeError(
+                "Latest quote dates differ across symbols; cannot build a consistent valuation: "
+                + ", ".join(f"{symbol}={quote.price_time}" for symbol, quote in quotes.items())
+            )
+        supplement_price_history(price_history, quotes)
     else:
         quotes = load_historical_prices(
             symbols=quote_symbols,
@@ -1918,6 +2040,8 @@ def main() -> int:
             )
             valuation_date = valuation_date_from_quotes(quotes, valuation_date)
 
+    if requested_as_of is not None:
+        supplement_price_history(price_history, quotes)
     prices = quotes_to_price_frame(quotes, valuation_date)
     output_name = args.output or f"account_report_{valuation_date:%Y-%m-%d}.md"
     output_path = Path(output_name).expanduser().resolve()
@@ -1965,30 +2089,6 @@ def main() -> int:
         )
         for quote_date in benchmark_quote_dates
     }
-
-    history_trades = all_trades[all_trades["Date"] <= valuation_date]
-    history_start_date = history_trades["Date"].min() - timedelta(days=10)
-    history_symbols = sorted(
-        set(
-            history_trades.loc[
-                ~history_trades["Symbol"].map(is_cash_symbol),
-                "Symbol",
-            ]
-        )
-        | {BENCHMARK_SYMBOL}
-    )
-    price_history = load_historical_series(
-        symbols=history_symbols,
-        start_date=history_start_date,
-        end_date=valuation_date,
-        api_key=api_key,
-        tiingo_api_key=tiingo_api_key,
-        cache_dir=Path(args.cache_dir),
-        allow_cache_fallback=args.allow_cache_fallback,
-    )
-    for symbol, quote in quotes.items():
-        if symbol in price_history:
-            price_history[symbol][valuation_date] = quote.price
 
     daily_performance_by_account = {
         account: build_daily_performance(
@@ -2068,6 +2168,9 @@ def main() -> int:
     )
 
     print(f"Wrote report to {output_path}")
+    print(f"Valuation date: {valuation_date}")
+    for symbol, quote in sorted(quotes.items()):
+        print(f"  {symbol}: {quote.source}, price time {quote.price_time or 'unknown'}")
     print(f"Accounts: {', '.join(report.account for report in reports)}")
     print(f"Combined total P&L: {money(combined['total_pnl'])}")
     print(f"Combined return: {pct(combined['return_pct'])}")

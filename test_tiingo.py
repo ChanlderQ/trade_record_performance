@@ -43,16 +43,89 @@ class TiingoTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             cache = Path(directory)
             quote = report.PriceQuote('VOO', 100, 'Tiingo EOD', '2026-09-25')
-            with patch.object(report, 'fetch_fmp_quote', side_effect=RuntimeError('failed')), \
+            with patch.object(report, 'market_today', return_value=date(2026, 9, 25)), \
                  patch.object(report, 'fetch_tiingo_quote', return_value=quote) as tiingo, \
-                 patch.object(report, 'fetch_yahoo_quote') as yahoo:
+                 patch.object(report, 'fetch_tiingo_realtime_quote') as realtime:
                 self.assertEqual(report.load_latest_prices(['VOO'], None, cache, False, 'key')['VOO'], quote)
                 tiingo.assert_called_once_with('VOO', 'key')
-                yahoo.assert_not_called()
+                realtime.assert_not_called()
             with patch.object(report, 'fetch_fmp_historical_series', side_effect=RuntimeError('failed')), \
                  patch.object(report, 'fetch_tiingo_prices', side_effect=RuntimeError('failed')), \
                  patch.object(report, 'fetch_yahoo_historical_series', return_value={date(2026, 9, 25): 100}):
                 self.assertEqual(report.load_historical_series(['VOO'], date(2026, 9, 25), date(2026, 9, 27), None, cache, False, 'key')['VOO'], {date(2026, 9, 25): 100})
+
+    def test_missing_today_is_supplemented_with_realtime(self):
+        with TemporaryDirectory() as directory:
+            history = {'VOO': {date(2026, 10, 2): 100}}
+            quote = report.PriceQuote('VOO', 101, 'Tiingo realtime reference', '2026-10-05T16:25:00-04:00')
+            with patch.object(report, 'market_today', return_value=date(2026, 10, 5)), \
+                 patch.object(report, 'fetch_tiingo_realtime_quote', return_value=quote), \
+                 patch.object(report, 'fetch_yahoo_quote') as yahoo:
+                actual = report.load_latest_prices(['VOO'], None, Path(directory), False, 'key', history)['VOO']
+                self.assertEqual(actual, quote)
+                yahoo.assert_not_called()
+            report.supplement_price_history(history, {'VOO': actual})
+            self.assertEqual(history['VOO'], {date(2026, 10, 2): 100, date(2026, 10, 5): 101})
+
+    def test_today_eod_is_preserved_without_realtime(self):
+        with TemporaryDirectory() as directory, \
+             patch.object(report, 'market_today', return_value=date(2026, 10, 5)), \
+             patch.object(report, 'fetch_tiingo_realtime_quote') as realtime:
+            actual = report.fetch_latest_quote('VOO', None, Path(directory), False, 'key', {date(2026, 10, 5): 100})
+            self.assertEqual(actual.price, 100)
+            self.assertEqual(actual.price_time, '2026-10-05')
+            realtime.assert_not_called()
+
+    def test_weekend_snapshot_does_not_create_today_or_replace_eod(self):
+        with TemporaryDirectory() as directory, \
+             patch.object(report, 'market_today', return_value=date(2026, 10, 4)), \
+             patch.object(report, 'fetch_tiingo_realtime_quote', return_value=report.PriceQuote('VOO', 101, 'realtime', '2026-10-03T00:10:00Z')):
+            history = {'VOO': {date(2026, 10, 2): 100}}
+            actual = report.fetch_latest_quote('VOO', None, Path(directory), False, 'key', history['VOO'])
+            report.supplement_price_history(history, {'VOO': actual})
+            self.assertEqual(actual.price, 100)
+            self.assertEqual(history['VOO'], {date(2026, 10, 2): 100})
+
+    def test_realtime_failure_uses_fallback(self):
+        with TemporaryDirectory() as directory, \
+             patch.object(report, 'market_today', return_value=date(2026, 10, 5)), \
+             patch.object(report, 'fetch_tiingo_realtime_quote', side_effect=RuntimeError('unavailable')), \
+             patch.object(report, 'fetch_fmp_quote', return_value=report.PriceQuote('VOO', 101, 'FMP', '2026-10-05 16:00:00')):
+            actual = report.fetch_latest_quote('VOO', None, Path(directory), False, 'key', {date(2026, 10, 2): 100})
+            self.assertEqual(actual.source, 'FMP')
+
+    def test_all_realtime_sources_fail_keeps_eod_with_warning(self):
+        with TemporaryDirectory() as directory, \
+             patch.object(report, 'market_today', return_value=date(2026, 10, 5)), \
+             patch.object(report, 'fetch_tiingo_realtime_quote', side_effect=RuntimeError('unavailable')), \
+             patch.object(report, 'fetch_fmp_quote', side_effect=RuntimeError('unavailable')), \
+             patch.object(report, 'fetch_yahoo_quote', side_effect=RuntimeError('unavailable')):
+            with self.assertWarns(UserWarning):
+                actual = report.fetch_latest_quote('VOO', None, Path(directory), False, 'key', {date(2026, 10, 2): 100})
+            self.assertEqual(actual.price_time, '2026-10-02')
+
+    def test_realtime_price_and_market_timezone(self):
+        payload = [{'ticker': 'VOO', 'tngoLast': 101, 'prevClose': 99, 'timestamp': '2026-10-06T00:10:00Z'}]
+        with patch.object(report, 'read_json_url', return_value=payload):
+            quote = report.fetch_tiingo_realtime_quote('VOO', 'key')
+        self.assertEqual(quote.price, 101)
+        self.assertEqual(report.quote_date(quote), date(2026, 10, 5))
+        self.assertEqual(report.valuation_date_from_quotes({'VOO': quote}, date(2026, 10, 6)), date(2026, 10, 5))
+
+    def test_realtime_invalid_payloads_fail(self):
+        for payload in (None, [], {'detail': 'denied'},
+                        [{'ticker': 'VOO', 'tngoLast': None, 'timestamp': '2026-10-05T20:00:00Z'}],
+                        [{'ticker': 'VOO', 'tngoLast': float('nan'), 'timestamp': '2026-10-05T20:00:00Z'}],
+                        [{'ticker': 'VOO', 'tngoLast': 101, 'timestamp': None}],
+                        [{'ticker': 'VOO', 'tngoLast': 101, 'timestamp': '2026-10-05'}]):
+            with self.subTest(payload=payload), patch.object(report, 'read_json_url', return_value=payload):
+                with self.assertRaises(RuntimeError):
+                    report.fetch_tiingo_realtime_quote('VOO', 'key')
+
+    def test_supplement_preserves_existing_daily_close(self):
+        history = {'VOO': {date(2026, 10, 5): 100}}
+        report.supplement_price_history(history, {'VOO': report.PriceQuote('VOO', 101, 'realtime', '2026-10-05T16:25:00-04:00')})
+        self.assertEqual(history['VOO'][date(2026, 10, 5)], 100)
 
     def test_http_error_does_not_expose_key(self):
         with patch.object(report, 'read_json_url', side_effect=HTTPError('https://example.com?token=secret', 401, 'Unauthorized', {}, None)):
