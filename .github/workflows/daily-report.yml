@@ -81,10 +81,8 @@ jobs:
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
         run: |
-          mkdir -p reports
           python generate_account_report.py \
-            --input data/trade_record.xlsx \
-            --output "reports/account_report_$(date +%F).md"
+            --input data/trade_record.xlsx
 
       - name: Upload report artifact
         if: steps.schedule-check.outputs.should_run == 'true'
@@ -92,6 +90,6 @@ jobs:
         with:
           name: account-report-${{ github.run_id }}
           path: |
-            reports/account_report_*.md
-            reports/account_report_*_nav.png
+            result/**/*.md
+            result/**/*_nav.png
           if-no-files-found: error

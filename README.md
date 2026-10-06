@@ -87,15 +87,19 @@ If `--as-of` is omitted, the script uses latest available quotes. If `--as-of`
 is provided, the script uses prices from the closest trading day on or before
 that date.
 
-By default, the report is written using the valuation date:
+By default, each run creates a folder under `result/` named for the actual
+valuation trading date (`YYYYMMDD`) and writes both result files there:
 
 ```text
-account_report_YYYY-MM-DD.md
-account_report_YYYY-MM-DD_nav.png
+result/YYYYMMDD/account_report_YYYY-MM-DD.md
+result/YYYYMMDD/account_report_YYYY-MM-DD_nav.png
 ```
 
-For an `--as-of` report, `YYYY-MM-DD` is the closest trading day on or before
-the requested date.
+The folder and filenames use the date returned by market data, not the calendar
+date of the run. For example, quotes dated October 6, 2026 are saved in
+`result/20261006/`. On weekends or holidays, the last available trading date is
+used. For an `--as-of` report, this is the closest trading day on or before the
+requested date. Re-running for the same trading date replaces that day's files.
 
 You can override the output path:
 
@@ -143,9 +147,10 @@ The sheet must be shared so the workflow can download it, for example
 **Anyone with the link can view**. If the sheet requires an interactive Google
 login, GitHub Actions will download an HTML login page instead of an Excel file.
 
-The workflow downloads the workbook at runtime, generates the report, and saves
-the Markdown file as a workflow artifact. It does not commit the workbook or the
-generated report back to the repository.
+The workflow downloads the workbook at runtime, generates both result files in
+`result/YYYYMMDD/`, and saves the Markdown report and PNG chart as a workflow
+artifact, preserving the trading-date folder. It does not commit the workbook or
+the generated results back to the repository.
 
 ## Workbook Format
 

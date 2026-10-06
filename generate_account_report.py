@@ -136,7 +136,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default=None,
-        help="Path for the Markdown report. Defaults to account_report_YYYY-MM-DD.md.",
+        help=(
+            "Optional output path override for the Markdown report. Defaults to "
+            "result/YYYYMMDD/account_report_YYYY-MM-DD.md, using the actual "
+            "valuation trading date returned by market data."
+        ),
     )
     parser.add_argument(
         "--as-of",
@@ -2043,7 +2047,9 @@ def main() -> int:
     if requested_as_of is not None:
         supplement_price_history(price_history, quotes)
     prices = quotes_to_price_frame(quotes, valuation_date)
-    output_name = args.output or f"account_report_{valuation_date:%Y-%m-%d}.md"
+    output_name = args.output or (
+        f"result/{valuation_date:%Y%m%d}/account_report_{valuation_date:%Y-%m-%d}.md"
+    )
     output_path = Path(output_name).expanduser().resolve()
     ytd_start_date = date(valuation_date.year - 1, 12, 31)
 
@@ -2151,6 +2157,7 @@ def main() -> int:
         combined_daily_performance.history,
         benchmark_curve,
     )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     write_nav_chart(
         nav_chart_path,
         chart_curves,
