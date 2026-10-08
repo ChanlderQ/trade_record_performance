@@ -5,6 +5,7 @@
 .DS_Store
 
 # Generated reports
+/result/
 account_report*.md
 account_report*_nav.png
 
